@@ -1,0 +1,217 @@
+# scriptorium machine-local configuration.
+#
+# Resolution order:
+#   1. this repo-local `config.toml` (when running from a source checkout)
+#   2. ~/.config/scriptorium/config.toml
+# Environment variables override the file.
+
+# Notes root
+# Every note write is confined here; relative attachment
+#   paths resolve against it.
+notes_root = "~/Obsidian/Second Brain"
+
+# Pipeline artifacts (jobs, history, capability cache).
+artifacts_dir = "~/.local/share/scriptorium"
+
+# Search paths
+# Source folders used by file completion, Extras export targets and MOC lookup.
+# Leave this empty to configure them later in the first-run setup or settings;
+# the notes root is always included implicitly and needs no entry here.
+search_paths = []
+
+# TUI pane layout
+# ---------------------------------------------------------------------------
+# The layout is a tree of splits.  A leaf places one box; a split divides its
+# cell between its children.
+#
+#   a | b     place a and b side by side (a "cols" split)
+#   a / b     stack a above b (a "rows" split)
+#   ( ... )   group a sub-layout; this is how both directions are mixed
+#   name:N    give a box (or a group) weight N inside its split (default 1)
+#
+# Weights are relative to the split that contains them, not to the terminal:
+#   "sources:2 / extras:1" gives sources twice the height of extras.
+# A split needs one operator per level: write "a | (b / c)", not "a | b / c".
+# The input line is special: it always keeps three rows (top border, one
+# content row, bottom border) whatever its weight.
+#
+# A list is shorthand for stacking rows: each string is one row and its "|"
+# splits are local to that row.  One expression string works too:
+#   tui_layout = "((sources / extras) | changes | (flashcards / logs)) / input"
+#
+# Every name must be a registered pane (see `[tui_panes]` below) and may appear
+# only once.  The input line is required.  A pane with a spawn key stays hidden
+# until that key is pressed; while hidden it is pruned from the tree, its share
+# goes to its siblings, and a split left with one child collapses into it.
+# That is how "logs" takes half of the flashcards column only after Ctrl-L.
+# Create your own pane using the API provided and your AI agent!
+tui_layout = [
+  "(sources / extras) | changes | (flashcards / logs)",
+  "input",
+]
+
+# Movement style for the TUI
+#   "vim"      - keeps the modal input line (normal and insert mode) and uses
+#                h/j/k/l
+#   "standard" - removes the modes (the input line is always editable)
+movement = "vim"
+
+# ---------------------------------------------------------------------------
+# Models
+# 
+# Language model (planning, note composition, scanned-page vision).
+# - Any OpenAI-compatible chat/completions endpoint
+# - A local model uses the same two lines, with a localhost base URL, e.g.:
+#   llm_base_url = "http://localhost:11434/v1"
+#   llm_model    = "llama3.1"
+# The key comes from SCRIPTORIUM_LLM_API_KEY, then llm_api_key below,
+#   then LLM_API_KEY.
+llm_model = "deepseek-chat"
+llm_base_url = "https://api.deepseek.com"
+llm_timeout = 240.0
+# llm_api_key = ""
+# How JSON is requested:
+#   "object": sends response_format {"type": "json_object"}
+#   "none":   omits the field for endpoints that reject it (the parser still
+#             tolerates prose and code fences).
+llm_json_mode = "object"
+
+# Speech-to-text.
+# - Local (default): download a speech-to-text model once and run it here. Any
+#   Hugging Face automatic-speech-recognition model id or a local directory
+#   works
+#     asr_model = "openai/whisper-large-v3"   # or "openai/whisper-small",
+#                                             # or "facebook/wav2vec2-base-960h",
+#                                             # or "/models/my-finetune"
+# - Remote OpenAI-compatible endpoint 
+#     asr_api_base_url = "https://api.groq.com/openai/v1"
+#     asr_api_model    = "whisper-large-v3"    # defaults to asr_model
+# - Hugging Face Inference Endpoint (raw audio body): add
+#     asr_api_protocol = "huggingface"
+#
+# The key comes from SCRIPTORIUM_ASR_API_KEY, then asr_api_key below, then the
+# usual provider variables (ASR_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, HF_TOKEN,
+# HUGGING_FACE_HUB_TOKEN).
+asr_model = "openai/whisper-large-v3"
+# asr_api_base_url = ""
+# asr_api_model = ""
+# asr_api_protocol = "openai" # openai | huggingface
+# asr_api_key = ""
+asr_api_timeout = 600.0
+device = "auto"
+batch_size = 8
+
+# Spoken language passed to the transcription backend.
+#   A code (e.g., "en" or "it") - forces it
+#   "detect"                    - leaves it to the backend's own language detection
+#   "ask"                       - prompts once per run
+language = "en"
+
+# Flashcard skill
+# The bundled skill inserts draft cards under the note's Flashcards heading.
+# Flashcards are created at the end of the note for anyone running them on Obsidian
+#   using the most common extension (like me). Point this at your own copy to
+#   customize it.
+# Note: The bundled skill accepts `add-drafts --file <note>` on stdin.
+#       In order to not flood your precious decks, you can add flashcards as drafts,
+#       and then run an automations to "activate" a subset of them.
+#       Anyway, a skill without that command is still supported.
+# flashcard_skill = "~/path/to/your/skill/manage_flashcards.py"
+flashcard_max_per_note = 60
+
+# Maximum characters kept from each related-note excerpt in the prompt context.
+extra_context_chars = 2600
+
+# Directory that receives images extracted from PDF sources.
+# A relative value resolves against notes_root
+attachment_dir = "Attachments"
+
+# Whether the configured model can read images.
+#   "auto"                  - probes the provider once and caches the answer in
+#                             $SCRIPTORIUM_ARTIFACTS_DIR/cache/capabilities.json
+#   "enabled" or "disabled" - to skip the probe
+image_input = "auto"
+
+# How a PDF page without a usable text layer is read.
+# - A page counts as scanned when its text layer is empty or almost empty
+# - A page that mixes text and figures keeps its text and is never re-read
+# - A page-sized image is treated as the page itself instead of being published
+#     as a figure.
+#   "vision" - render the page and ask the configured model to transcribe it.
+#              One API call per scanned page. Reads slides, diagrams, tables and
+#              formulas, so it is the better choice for lecture material; it costs
+#              tokens and can misread, so check the run warnings.
+#   "ocr"    - render the page and run Tesseract locally. No API cost and no
+#              network, but it only reads plain typed text: figures, formulas,
+#              handwriting and multi-column layouts are lost. Prefer it for
+#              batches of typed text scans; it needs the `tesseract` binary and
+#              its language data installed.
+scanned_pdf = "vision"
+
+# Tesseract language data for scanned_pdf = "ocr", joined with "+", (e.g., 
+#   "eng+ita")
+# Empty means Tesseract's own default language.
+ocr_languages = ""
+
+# Upper bound on pages read per PDF by the scanned-page fallback, so one long
+# scan cannot run up the bill or stall the job. Later pages keep no text and
+# produce a scanned_pdf_capped warning; raise the value to read them.
+max_scanned_pages = 100
+
+# How a merge into an existing note is decided. A merge may edit or remove
+# existing lines, so the unified diff is always the thing being approved.
+#   "ask"    - show the diff; apply it, skip it, or write a conflict file.
+#   "apply"  - apply every composed merge without asking (the diff is still
+#              recorded in the report and in apply.json).
+#   "manual" - never write the note: write a git-style conflict file into the
+#              job directory and let the user reconcile the two versions by hand.
+merge_policy = "ask"
+
+# How the target note of each planned note is chosen.
+#   "ask"    - show the ranked candidates (merge into a note/section, or create
+#              a new note) and let the user pick; with no answer a new note is kept.
+#   "auto"   - pick the best existing target only when its score is at least
+#              target_auto_above and it leads the runner-up by target_min_gap;
+#              otherwise create a new note and record the candidates as a TODO.
+#   "create" - always create a new note; candidates are still listed in the TODOs.
+target_policy = "ask"
+
+# Score thresholds for target_policy = "auto", both between 0 and 1.
+target_auto_above = 0.85
+target_min_gap = 0.15
+
+# Warning codes that must never be recorded (see src/scriptorium/warnings.py for
+# the full list). Empty means every warning is kept.
+disabled_warnings = []
+
+# ---------------------------------------------------------------------------
+# Box registry and per-box options.
+#
+# One self-contained module per pane.
+# A pane is any module exposing a `pane_api.Pane` subclass whose `name` matches
+#   the key here; it is addressed as "package.module:ClassName" (a bare
+#   "package.module" means the module exposes `Pane`).
+# A table entry can also carry the spawn key:
+#
+#   [tui_panes.logs]
+#   key = "C-l"            # "" or omitted = always visible
+#
+# Sizes are not configured per box: the proportions live in tui_layout.
+[tui_panes.sources]
+target = "scriptorium.panes.sources:SourcesPane"
+
+[tui_panes.changes]
+target = "scriptorium.panes.changes:ChangesPane"
+
+[tui_panes.flashcards]
+target = "scriptorium.panes.flashcards:FlashcardsPane"
+
+[tui_panes.input]
+target = "scriptorium.panes.input_pane:InputPane"
+
+[tui_panes.extras]
+target = "scriptorium.panes.extras:ExtrasPane"
+
+[tui_panes.logs]
+target = "scriptorium.panes.logs:LogsPane"
+
