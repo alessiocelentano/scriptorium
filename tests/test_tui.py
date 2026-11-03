@@ -112,6 +112,31 @@ class CompletionTests(unittest.TestCase):
         self.assertIn("notes.md", {match.relative for match in matches})
         self.assertNotIn("lecture-folder", {match.relative for match in matches})
 
+    def test_directory_matches_follow_direct_matches_newest_first(self):
+        downloads = self.root / "Downloads"
+        (downloads / "nested").mkdir(parents=True)
+        old = downloads / "old.pdf"
+        new = downloads / "new.pdf"
+        deep = downloads / "nested" / "deep.pdf"
+        for path, modified in ((old, 1_000), (new, 3_000), (deep, 2_000)):
+            path.write_bytes(b"x")
+            os.utime(path, (modified, modified))
+        direct = self.root / "Downloads.txt"
+        direct.write_text("x", encoding="utf-8")
+        os.utime(direct, (500, 500))
+
+        matches = complete_files(self.root, "Downloads")
+
+        self.assertEqual(
+            [match.relative for match in matches],
+            [
+                "Downloads.txt",
+                "Downloads/new.pdf",
+                "Downloads/nested/deep.pdf",
+                "Downloads/old.pdf",
+            ],
+        )
+
     def test_token_helpers(self):
         text = "video.mp4 'University/Course MOC.md' slides.pdf"
         spans = token_spans(text)
@@ -1369,6 +1394,37 @@ class AppRenderTests(unittest.TestCase):
         self.assertEqual(app.source_paths, [selected])
         self.assertEqual(app.input_text, "")
         self.assertIsNone(app.completion)
+
+    def test_completion_index_is_reused_until_the_input_is_cleared(self):
+        app = TuiApp(config=self.config)
+        app.input_text = "s"
+        app.cursor = 1
+        app.refresh_completion()
+        index = app._completion_index
+        self.assertIsNotNone(index)
+
+        app.input_text = "sl"
+        app.cursor = 2
+        app.refresh_completion()
+        self.assertIs(app._completion_index, index)
+
+        app.input_text = ""
+        app.cursor = 0
+        app.refresh_completion()
+        self.assertIsNone(app._completion_index)
+
+    def test_completion_index_is_rebuilt_when_the_roots_change(self):
+        app = TuiApp(config=self.config)
+        app.input_text = "s"
+        app.cursor = 1
+        app.refresh_completion()
+        index = app._completion_index
+        self.assertIsNotNone(index)
+
+        app.search_roots = [self.vault]
+        app.refresh_completion()
+
+        self.assertIsNot(app._completion_index, index)
 
     def test_c_opens_the_list_of_available_commands(self):
         app = TuiApp(config=self.config)

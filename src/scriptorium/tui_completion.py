@@ -1,8 +1,9 @@
 """Recursive, filename-based tab completion.
 
 Completion searches every file below one or more configured root directories.
-Directories are never offered as candidates: typing ``lec`` finds
-``lectures/lecture-01.mp4`` even though the intermediate directory is not shown.
+Directories are never offered as candidates, but a directory name is still
+useful: typing ``Downloads`` first lists files whose own name starts with it,
+then everything inside directories whose name starts with it, newest first.
 When more than one root is configured, results carry the root name in
 ``display`` so the same relative path in different roots stays distinguishable.
 """
@@ -63,61 +64,207 @@ def complete_files(
     roots: Path | Sequence[Path],
     prefix: str,
     *,
-    limit: int = 200,
+    limit: int = 50,
     max_scanned: int = 250_000,
 ) -> list[FileMatch]:
-    """Return files below ``roots`` whose name starts with ``prefix``.
+    """Return files below ``roots`` that belong to ``prefix``.
 
-    The search is recursive and matches on the basename only, so a prefix never
-    selects a directory.  Results are sorted by relative path and deduplicated
-    by absolute path.
+    The first group holds files whose own name starts with ``prefix``; the
+    second holds files inside directories whose name starts with it, newest
+    first.  Builds a fresh index and queries it.  The TUI reuses a
+    :class:`CompletionIndex` across keystrokes instead; this helper keeps the
+    one-shot behaviour for callers that do not need a cache.
     """
-    root_list = [root for root in _normalise_roots(roots) if root.is_dir()]
-    if not root_list:
-        return []
+    return build_completion_index(roots, max_scanned=max_scanned).complete(prefix, limit=limit)
 
-    needle = prefix.strip().strip("'\"")
-    if "/" in needle:
-        needle = needle.rsplit("/", 1)[-1]
-    needle = needle.casefold()
 
-    matches: list[FileMatch] = []
-    seen: set[Path] = set()
+@dataclass(frozen=True, slots=True)
+class _IndexedDirectory:
+    """One directory in the index, linked to its parent by position."""
+
+    name: str
+    parent: int
+
+
+@dataclass(slots=True)
+class _IndexedFile:
+    """One file in the index; ``modified`` is read lazily on first query."""
+
+    path: str
+    name: str
+    relative: str
+    root: Path
+    group: str
+    directory: int
+    modified: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionIndex:
+    """A reusable snapshot of the files below the completion roots.
+
+    Building the snapshot is the expensive part; filtering it for a new prefix
+    only walks memory.  The snapshot has no time-based invalidation: the TUI
+    drops it when the input line is cleared or when the roots change.
+    """
+
+    roots: tuple[Path, ...]
+    directories: tuple[_IndexedDirectory, ...]
+    files: tuple[_IndexedFile, ...]
+
+    def complete(self, prefix: str, *, limit: int = 50) -> list[FileMatch]:
+        """Return the two groups of matches for ``prefix``.
+
+        1. files whose own name starts with ``prefix``, sorted by relative path;
+        2. files contained in directories whose name starts with ``prefix``,
+           sorted from the most recently modified file to the oldest.
+        """
+        needle = _needle(prefix)
+        direct: list[FileMatch] = []
+        contained: list[tuple[float, FileMatch]] = []
+        directory_memo: dict[int, bool] = {}
+        for entry in self.files:
+            if entry.name.startswith(needle):
+                direct.append(_file_match(entry))
+                continue
+            if not _directory_matches(self.directories, entry.directory, needle, directory_memo):
+                continue
+            if entry.modified is None:
+                try:
+                    entry.modified = os.stat(entry.path).st_mtime
+                except OSError:
+                    continue
+            contained.append((entry.modified, _file_match(entry)))
+
+        direct.sort(key=lambda match: (match.relative.casefold(), match.relative, match.group))
+        contained.sort(
+            key=lambda item: (
+                -item[0],
+                item[1].relative.casefold(),
+                item[1].relative,
+                item[1].group,
+            )
+        )
+        matches = direct + [match for _, match in contained]
+        return matches[:limit]
+
+
+def build_completion_index(
+    roots: Path | Sequence[Path],
+    *,
+    max_scanned: int = 250_000,
+) -> CompletionIndex:
+    """Scan ``roots`` once and return a reusable :class:`CompletionIndex`.
+
+    Directory-match state is propagated during the walk, so the per-file cost
+    is just a name check instead of constructing and splitting a path.  The
+    index stores strings and a directory id per file; ``Path`` objects are only
+    created for the matches actually returned.
+    """
+    requested = _normalise_roots(roots)
+    root_list = [root for root in requested if root.is_dir()]
+    directories: list[_IndexedDirectory] = []
+    files: list[_IndexedFile] = []
+    dedupe = len(root_list) > 1
+    seen: set[str] = set()
     scanned = 0
     show_group = len(root_list) > 1
+
     for root in root_list:
         group = root.name if show_group else ""
-        for directory, subdirs, files in os.walk(root, followlinks=False):
+        root_key = os.fspath(root)
+        directories.append(_IndexedDirectory(root.name.casefold(), -1))
+        root_directory = len(directories) - 1
+        directory_ids = {root_key: root_directory}
+        for directory, subdirs, names in os.walk(root, followlinks=False):
             subdirs[:] = [
                 name
                 for name in subdirs
                 if not name.startswith(".") and name not in SKIP_COMPLETION_DIRECTORIES
             ]
-            for name in files:
+            if directory == root_key:
+                directory_id = root_directory
+            else:
+                directory_id = directory_ids.get(directory)
+                if directory_id is None:
+                    parent = directory_ids.get(os.path.dirname(directory), root_directory)
+                    directories.append(
+                        _IndexedDirectory(os.path.basename(directory).casefold(), parent)
+                    )
+                    directory_id = len(directories) - 1
+                    directory_ids[directory] = directory_id
+            directory_abs = os.path.abspath(directory) if dedupe else ""
+            for name in names:
                 if name.startswith("."):
                     continue
                 scanned += 1
                 if scanned > max_scanned:
                     break
-                if not name.casefold().startswith(needle):
-                    continue
-                path = Path(directory) / name
-                resolved = path.resolve()
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                try:
-                    relative = path.relative_to(root).as_posix()
-                except ValueError:
-                    relative = path.as_posix()
-                matches.append(FileMatch(path=path, relative=relative, root=root, group=group))
+                path = os.path.join(directory, name)
+                if dedupe:
+                    identity = os.path.normcase(os.path.join(directory_abs, name))
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                relative = os.path.relpath(path, root)
+                if os.sep != "/":
+                    relative = relative.replace(os.sep, "/")
+                files.append(
+                    _IndexedFile(
+                        path=path,
+                        name=name.casefold(),
+                        relative=relative,
+                        root=root,
+                        group=group,
+                        directory=directory_id,
+                    )
+                )
             if scanned > max_scanned:
                 break
         if scanned > max_scanned:
             break
 
-    matches.sort(key=lambda match: (match.relative.casefold(), match.relative, match.group))
-    return matches[:limit]
+    return CompletionIndex(
+        roots=tuple(requested),
+        directories=tuple(directories),
+        files=tuple(files),
+    )
+
+
+def _file_match(entry: _IndexedFile) -> FileMatch:
+    return FileMatch(
+        path=Path(entry.path),
+        relative=entry.relative,
+        root=entry.root,
+        group=entry.group,
+    )
+
+
+def _needle(prefix: str) -> str:
+    """The case-folded name fragment a prefix completes."""
+    needle = prefix.strip().strip("'\"")
+    if "/" in needle:
+        needle = needle.rsplit("/", 1)[-1]
+    return needle.casefold()
+
+
+def _directory_matches(
+    directories: tuple[_IndexedDirectory, ...],
+    index: int,
+    needle: str,
+    memo: dict[int, bool],
+) -> bool:
+    """True when this directory or one of its ancestors starts with ``needle``."""
+    chain: list[int] = []
+    current = index
+    while current != -1 and current not in memo:
+        chain.append(current)
+        current = directories[current].parent
+    matched = memo[current] if current != -1 else False
+    for node in reversed(chain):
+        matched = matched or directories[node].name.startswith(needle)
+        memo[node] = matched
+    return memo[index]
 
 
 def complete_paths(prefix: str, *, include_files: bool = True, limit: int = 200) -> list[FileMatch]:

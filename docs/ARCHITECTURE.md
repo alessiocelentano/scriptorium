@@ -236,7 +236,10 @@ setting as `arrow_movements`, so the same rendering code serves both styles.
 File completion searches an ordered list of roots, `Config.search_paths`; the first
 entry resolves relative paths typed in the input line. The notes root is always
 appended as an implicit entry, while the first-run wizard and the settings modal
-show and write only `Config.user_search_paths` (the paths the user configured).  The TUI settings modal
+show and write only `Config.user_search_paths` (the paths the user configured).
+The TUI scans those roots once per input session into a `CompletionIndex`; later
+keystrokes filter that snapshot in memory. The snapshot has no TTL and is dropped
+when the input line is cleared or the roots change.  The TUI settings modal
 opens with `s` and edits every `Config` field except the two custom-pane tables
 (`tui_panes` and `tui_pane_keys`, which stay TOML-only).  `src/scriptorium/settings.py`
 is a declarative schema of sections and fields; `tui.py` renders one section in

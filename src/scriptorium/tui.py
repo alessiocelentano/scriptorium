@@ -131,9 +131,10 @@ from .slash_commands import SLASH_COMMANDS, SlashCommand, matching_commands
 from .sources import clean_course_name
 from .state import STAGE_LABELS, Stage
 from .tui_completion import (
+    CompletionIndex,
     FileMatch,
+    build_completion_index,
     complete_directories,
-    complete_files,
     complete_note_paths,
     complete_paths,
     replace_token,
@@ -359,6 +360,7 @@ class TuiApp:
     merge_review: PromptModal | None = None
     completion: CompletionPopup | None = None
     settings: SettingsState | None = None
+    _completion_index: CompletionIndex | None = field(default=None, repr=False, compare=False)
     wizard: WizardState | None = None
     log_lines: list[str] = field(default_factory=list)
     spawn_visible: dict[str, bool] = field(default_factory=dict)
@@ -892,6 +894,7 @@ class TuiApp:
         self.mode = mode
         self.editor = self._new_editor("", cursor=0, mode=mode)
         self.completion = None
+        self._completion_index = None
         if self.active == self._editor_name:
             self.active = None
 
@@ -1610,8 +1613,13 @@ class TuiApp:
         text = self.input_text
         if not text.strip():
             self.completion = None
+            self._completion_index = None
             return
-        matches = complete_files(self.search_roots, text)
+        index = self._completion_index
+        if index is None or index.roots != tuple(self.search_roots):
+            index = build_completion_index(self.search_roots)
+            self._completion_index = index
+        matches = index.complete(text)
         if not matches:
             self.completion = None
             return
