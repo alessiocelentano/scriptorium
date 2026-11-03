@@ -3,6 +3,8 @@
 > [!WARNING]
 > This repository is still unstable, though your notes are safe. Take precautions and please report bugs.
 
+![screenshot](assets/screenshot.png)
+
 The operating system for students who care about details and their own time.
 
 Scriptorium, although highly customizable, is written with a few pillars in mind:
