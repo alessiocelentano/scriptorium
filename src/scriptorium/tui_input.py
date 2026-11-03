@@ -82,16 +82,29 @@ def _roots(root: Path | Sequence[Path]) -> list[Path]:
     return [Path(candidate) for candidate in root]
 
 
+def path_exists(path: Path) -> bool:
+    """``Path.exists`` that treats an over-long or unreadable name as missing.
+
+    A pasted list can contain one very long line; probing it with ``exists()``
+    raises ``OSError(ENAMETOOLONG)`` on some platforms, which would abort the
+    paste instead of reporting the path as not found.
+    """
+    try:
+        return path.exists()
+    except (OSError, ValueError):
+        return False
+
+
 def _resolve(token: str, root: Path | Sequence[Path]) -> Path:
     path = Path(token).expanduser()
     if path.is_absolute():
         return path
-    if path.exists():
+    if path_exists(path):
         return path.resolve()
     roots = _roots(root)
     for candidate in roots:
         resolved = candidate / path
-        if resolved.exists():
+        if path_exists(resolved):
             return resolved
     return roots[0] / path if roots else path
 
@@ -104,20 +117,18 @@ def _is_moc(path: Path) -> bool:
     return any(part.casefold() == "university" for part in path.parts)
 
 
-def parse_input(text: str, root: Path | Sequence[Path]) -> InputPlan:
-    """Split the input line into sources and MOC hints.
+def _strip_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        return token[1:-1]
+    return token
 
-    ``root`` may be a single completion root or a list of them; relative tokens
-    are resolved against the first root that contains the file.
-    """
-    try:
-        tokens = shlex.split(text, posix=True)
-    except ValueError as exc:
-        return InputPlan(error=f"unterminated quote: {exc}")
 
+def _plan_from_tokens(tokens: Sequence[str], root: Path | Sequence[Path]) -> InputPlan:
     plan = InputPlan()
     seen: set[Path] = set()
     for token in tokens:
+        if not token:
+            continue
         path = _resolve(token, root)
         if path in seen:
             continue
@@ -138,6 +149,43 @@ def parse_input(text: str, root: Path | Sequence[Path]) -> InputPlan:
     return plan
 
 
+def parse_input(text: str, root: Path | Sequence[Path]) -> InputPlan:
+    """Split the input line into sources and MOC hints.
+
+    ``root`` may be a single completion root or a list of them; relative tokens
+    are resolved against the first root that contains the file.
+    """
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError as exc:
+        return InputPlan(error=f"unterminated quote: {exc}")
+    return _plan_from_tokens(tokens, root)
+
+
+def parse_pasted_input(text: str, root: Path | Sequence[Path]) -> InputPlan:
+    """Parse a clipboard paste as a list of source paths.
+
+    A multi-line paste is one path per line, so a path containing spaces is
+    kept whole.  A single-line paste is split with the same shell-like rules as
+    the input line, unless the entire line already names an existing file.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" in normalized:
+        tokens = [_strip_quotes(line.strip()) for line in normalized.split("\n") if line.strip()]
+    else:
+        stripped = normalized.strip()
+        if not stripped:
+            return InputPlan(error="add at least one source path (video, slides, notes, PDF)")
+        if path_exists(_resolve(stripped, root)):
+            tokens = [_strip_quotes(stripped)]
+        else:
+            try:
+                tokens = shlex.split(stripped, posix=True)
+            except ValueError as exc:
+                return InputPlan(error=f"unterminated quote: {exc}")
+    return _plan_from_tokens(tokens, root)
+
+
 def missing_paths(plan: InputPlan) -> list[Path]:
     paths = [*plan.sources, *plan.moc_hints]
-    return [path for path in paths if not path.exists()]
+    return [path for path in paths if not path_exists(path)]

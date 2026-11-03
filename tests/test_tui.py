@@ -23,6 +23,7 @@ from scriptorium.targeting import NoteTarget
 from scriptorium.tui import (
     STYLE_ACTIVE_BORDER,
     STYLE_FOCUS,
+    PasteEvent,
     PromptModal,
     TuiApp,
 )
@@ -42,7 +43,12 @@ from scriptorium.tui_data import (
     load_card_groups,
     load_diff_entries,
 )
-from scriptorium.tui_input import clean_course_name, missing_paths, parse_input
+from scriptorium.tui_input import (
+    clean_course_name,
+    missing_paths,
+    parse_input,
+    parse_pasted_input,
+)
 from scriptorium.tui_layout import (
     DEFAULT_LAYOUT,
     Leaf,
@@ -269,6 +275,39 @@ class InputTests(unittest.TestCase):
     def test_missing_paths(self):
         plan = parse_input("missing.mp4", self.root)
         self.assertEqual(missing_paths(plan), [self.root / "missing.mp4"])
+
+    def test_parse_pasted_input_keeps_one_path_per_line_with_spaces(self):
+        plan = parse_pasted_input(
+            "videos/my lecture.mp4\nslides/Week 01.pdf\n",
+            self.root,
+        )
+        self.assertEqual(
+            plan.sources,
+            [
+                self.root / "videos" / "my lecture.mp4",
+                self.root / "slides" / "Week 01.pdf",
+            ],
+        )
+
+    def test_parse_pasted_input_treats_a_single_line_as_one_existing_path(self):
+        path = self.root / "a lecture with spaces.mp4"
+        path.write_bytes(b"x")
+        plan = parse_pasted_input(str(path), self.root)
+        self.assertEqual(plan.sources, [path])
+
+    def test_parse_pasted_input_splits_a_single_line_list(self):
+        plan = parse_pasted_input("a.mp4 b.mkv", self.root)
+        self.assertEqual(plan.sources, [self.root / "a.mp4", self.root / "b.mkv"])
+
+    def test_parse_pasted_input_survives_an_over_long_single_line(self):
+        text = " ".join(["lecture.mp4"] * 100)
+        plan = parse_pasted_input(text, self.root)
+        self.assertEqual(plan.sources, [self.root / "lecture.mp4"])
+
+    def test_parse_pasted_input_reports_an_over_long_path_as_missing(self):
+        path = self.root / ("x" * 300)
+        plan = parse_pasted_input(str(path), self.root)
+        self.assertEqual(missing_paths(plan), [path])
 
     def test_clean_course_name(self):
         self.assertEqual(clean_course_name("Foundations_of_AI-MOC"), "Foundations of AI")
@@ -1216,6 +1255,23 @@ class FakeScreen:
         return None
 
 
+class FakeKeyScreen(FakeScreen):
+    """A screen whose key reader serves a fixed script of characters."""
+
+    def __init__(self, keys: list):
+        super().__init__()
+        self.keys = list(keys)
+        self.timeout_ms = 0
+
+    def get_wch(self):
+        if not self.keys:
+            raise curses.error("no more keys")
+        return self.keys.pop(0)
+
+    def timeout(self, milliseconds):
+        self.timeout_ms = milliseconds
+
+
 class AppRenderTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1315,6 +1371,86 @@ class AppRenderTests(unittest.TestCase):
         self.assertIsNone(state.editor)
         app._handle_settings_key("\x1b")
         self.assertIsNone(app.settings)
+
+    def test_bracketed_paste_markers_become_one_paste_event(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeKeyScreen(list("\x1b[200~nested/slides.pdf\nnested/slides-2.pdf\x1b[201~"))
+        event = app._read_key()
+        self.assertIsInstance(event, PasteEvent)
+        app._handle_key(event)
+        self.assertEqual(
+            app.source_paths,
+            [self.root / "nested" / "slides.pdf", self.root / "nested" / "slides-2.pdf"],
+        )
+
+    def test_a_lone_escape_is_not_swallowed_by_paste_detection(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeKeyScreen(["\x1b"])
+        self.assertEqual(app._read_key(), "\x1b")
+
+    def test_paste_adds_every_existing_path_without_enter(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        first = self.root / "nested" / "slides.pdf"
+        second = self.root / "nested" / "slides-2.pdf"
+        app._handle_key(PasteEvent(text=f"{first}\n{second}\n"))
+        self.assertEqual(app.source_paths, [first, second])
+        self.assertEqual(app.input_text, "")
+        self.assertIsNone(app.completion)
+        self.assertIn("added 2 source(s)", app.status)
+        self.assertNotIn("/run", app.status)
+
+    def test_paste_works_when_the_input_box_is_not_focused(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.focus = "sources"
+        app.active = None
+        source = self.root / "nested" / "slides.pdf"
+        app._handle_key(PasteEvent(text=str(source)))
+        self.assertEqual(app.source_paths, [source])
+
+    def test_paste_of_a_long_single_line_list_does_not_crash(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        source = self.root / "nested" / "slides.pdf"
+        app._handle_key(PasteEvent(text=" ".join([str(source)] * 100)))
+        self.assertEqual(app.source_paths, [source])
+        self.assertEqual(app.status, "added 1 source(s)")
+
+    def test_paste_reports_missing_files_in_the_header_and_log(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        found = self.root / "nested" / "slides.pdf"
+        missing_a = self.root / "missing-a.pdf"
+        missing_b = self.root / "missing-b.pdf"
+        app._handle_key(PasteEvent(text=f"{found}\n{missing_a}\n{missing_b}"))
+        self.assertEqual(app.source_paths, [found])
+        self.assertEqual(
+            app.status,
+            "2 source(s) not found (open logs for details)",
+        )
+        self.assertIn(f"[warn] file not found: {missing_a}", app.log_lines)
+        self.assertIn(f"[warn] file not found: {missing_b}", app.log_lines)
+
+    def test_paste_does_not_trigger_completion(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.input_text = "sli"
+        app.cursor = 3
+        app._sync_editor_from_fields()
+        source = self.root / "nested" / "slides.pdf"
+        with mock.patch.object(app, "refresh_completion") as refresh:
+            app._handle_key(PasteEvent(text=str(source)))
+        refresh.assert_not_called()
+        self.assertEqual(app.input_text, "sli")
+
+    def test_paste_is_ignored_while_a_modal_is_open(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.modal = PromptModal(kind="commands", payload={}, box={}, event=threading.Event())
+        source = self.root / "nested" / "slides.pdf"
+        app._handle_key(PasteEvent(text=str(source)))
+        self.assertEqual(app.source_paths, [])
 
     def test_input_line_starts_in_normal_mode(self):
         app = TuiApp(config=self.config)

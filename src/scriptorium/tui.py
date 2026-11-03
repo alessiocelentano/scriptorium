@@ -140,7 +140,7 @@ from .tui_completion import (
     replace_token,
 )
 from .tui_data import CardGroup, DiffEntry, load_asides, load_card_groups, load_diff_entries
-from .tui_input import missing_paths, parse_input
+from .tui_input import missing_paths, parse_input, parse_pasted_input, path_exists
 from .tui_layout import (
     PANE_INPUT,
     PaneRect,
@@ -184,6 +184,22 @@ from .vimline import VimLineEditor
 # width on every terminal that ships a decent Unicode font.
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPINNER_INTERVAL = 0.1
+
+# Bracketed paste: the terminal wraps clipboard text in these markers, so a
+# multi-line paste arrives as one event instead of a burst of keystrokes.
+PASTE_ENABLE = "\x1b[?2004h"
+PASTE_DISABLE = "\x1b[?2004l"
+PASTE_START = "\x1b[200~"
+PASTE_END = "\x1b[201~"
+KEY_TIMEOUT_MS = 120
+PASTE_PROBE_WINDOW = 0.05
+
+
+@dataclass
+class PasteEvent:
+    """A whole clipboard paste, already stripped of its terminal markers."""
+
+    text: str
 
 
 @dataclass
@@ -367,6 +383,7 @@ class TuiApp:
     log_scroll: int = 0
     fullscreen: str | None = None
     _spawn_return_focus: dict[str, str] = field(default_factory=dict)
+    _pending_keys: list[Any] = field(default_factory=list, repr=False, compare=False)
     _anchor: tuple[float, float] | None = None
 
     _colors: dict[str, int] = field(default_factory=dict)
@@ -550,12 +567,13 @@ class TuiApp:
             curses.set_escdelay(25)
         except (AttributeError, curses.error):
             pass
-        self.scr.timeout(120)
+        self.scr.timeout(KEY_TIMEOUT_MS)
         self._init_colors()
         stdout, stderr = sys.stdout, sys.stderr
         sys.stdout = _LogStream(self, stdout)
         sys.stderr = _LogStream(self, stderr)
         try:
+            self._write_terminal(PASTE_ENABLE)
             while not self.done:
                 self._drain_events()
                 self._maybe_accept_prompt()
@@ -566,19 +584,102 @@ class TuiApp:
         finally:
             sys.stdout = stdout
             sys.stderr = stderr
+            self._write_terminal(PASTE_DISABLE)
         try:
             curses.curs_set(1)
         except curses.error:
             pass
 
-    def _read_key(self) -> Any:
+    def _write_terminal(self, sequence: str) -> None:
+        """Write one control sequence to the terminal, outside the curses buffer."""
         try:
-            return self.scr.get_wch()
+            os.write(sys.stdout.fileno(), sequence.encode("ascii"))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _read_key(self) -> Any:
+        """Read one key, translating a bracketed paste into a PasteEvent."""
+        if self._pending_keys:
+            return self._pending_keys.pop(0)
+        try:
+            key = self.scr.get_wch()
         except curses.error:
             return None
         except KeyboardInterrupt:
             self.done = True
             return None
+        if key in {"\x1b", 27}:
+            return self._probe_paste_start(key)
+        return key
+
+    def _probe_paste_start(self, escape_key: Any) -> Any:
+        """Look just past an Escape for the bracketed-paste start marker.
+
+        ncurses does not decode the marker itself, so the sequence arrives as
+        ``Esc`` followed by ordinary characters.  Reading them back keeps a
+        lone Escape instantaneous and lets a paste be recognized before any
+        character reaches the input editor.
+        """
+        gathered: list[str] = [str(escape_key)]
+        extra: Any = None
+        try:
+            self.scr.timeout(0)
+        except curses.error:
+            return escape_key
+        try:
+            deadline = time.monotonic() + PASTE_PROBE_WINDOW
+            while len(gathered) < len(PASTE_START):
+                try:
+                    key = self.scr.get_wch()
+                except curses.error:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.001)
+                    continue
+                if not isinstance(key, str):
+                    extra = key
+                    break
+                gathered.append(key)
+                if "".join(gathered) != PASTE_START[: len(gathered)]:
+                    break
+        finally:
+            try:
+                self.scr.timeout(KEY_TIMEOUT_MS)
+            except curses.error:
+                pass
+        if "".join(gathered) == PASTE_START:
+            return PasteEvent(text=self._read_paste_body())
+        self._pending_keys.extend(gathered[1:])
+        if extra is not None:
+            self._pending_keys.append(extra)
+        return escape_key
+
+    def _read_paste_body(self) -> str:
+        """Collect pasted characters until the end marker (or the paste stalls)."""
+        characters: list[str] = []
+        tail = ""
+        try:
+            self.scr.timeout(KEY_TIMEOUT_MS)
+        except curses.error:
+            pass
+        while True:
+            try:
+                key = self.scr.get_wch()
+            except curses.error:
+                if tail:
+                    # The marker was split and the rest never came: treat what
+                    # we have as ordinary text rather than losing the paste.
+                    return "".join(characters)
+                continue
+            if isinstance(key, int):
+                if key in {10, 13, curses.KEY_ENTER}:
+                    key = "\n"
+                else:
+                    continue
+            characters.append(key)
+            tail = (tail + key)[-len(PASTE_END) :]
+            if tail == PASTE_END:
+                return "".join(characters[: -len(PASTE_END)])
 
     # -- colors -------------------------------------------------------------- #
 
@@ -866,7 +967,7 @@ class TuiApp:
     def _add_source(self, source: Path) -> None:
         """Add one existing path to the sidebar and clear the input line."""
         source = Path(source).expanduser()
-        if not source.exists():
+        if not path_exists(source):
             self.status = f"file not found: {source}"
             return
         plan = parse_input(shlex.quote(str(source)), self.search_roots)
@@ -883,6 +984,60 @@ class TuiApp:
         self.status = (
             f"added {source.name} · {len(self.source_paths)} source(s){hint} · /run to start"
         )
+
+    def _handle_paste(self, text: str) -> None:
+        """Load every path in a clipboard paste, reporting the missing ones.
+
+        A paste is one event, so it never opens completion and never needs an
+        Enter key: the whole list lands in Sources at once, wherever the focus
+        happens to be.  Missing paths are counted in the header and listed in
+        the log window, while the found ones are still added.
+        """
+        if (
+            self.wizard is not None
+            or self.settings is not None
+            or self.modal is not None
+            or self.merge_review is not None
+        ):
+            # An overlay owns the keyboard: never turn a paste into sources
+            # behind a settings form or a merge review.
+            return
+        if not text.strip():
+            return
+        plan = parse_pasted_input(text, self.search_roots)
+        if plan.error and not plan.moc_hints:
+            self.status = f"paste failed: {plan.error}"
+            self._on_log(f"[warn] paste failed: {plan.error}")
+            return
+
+        existing = [path for path in plan.sources if path_exists(path)]
+        missing = [path for path in [*plan.sources, *plan.moc_hints] if not path_exists(path)]
+        added = 0
+        for source in existing:
+            if source not in self.source_paths:
+                self.source_paths.append(source)
+                added += 1
+        if existing:
+            self.source_index = self.source_paths.index(existing[-1])
+        if plan.moc_hints and path_exists(plan.moc_hints[0]):
+            self.moc_hint = plan.moc_hints[0]
+        # A paste is not typing: drop any popup left from an earlier edit.
+        self.completion = None
+
+        for path in missing:
+            self._on_log(f"[warn] file not found: {path}")
+        if missing:
+            total = len(plan.sources) + len(plan.moc_hints)
+            self._on_log(f"[warn] pasted {total} path(s), {len(missing)} not found")
+            self.status = f"{len(missing)} source(s) not found (open logs for details)"
+            return
+        if added:
+            self.status = f"added {added} source(s)"
+            return
+        if plan.moc_hints:
+            self.status = f"MOC hint set to {plan.moc_hints[0].name}"
+            return
+        self.status = "nothing new to add"
 
     def _clear_input(self) -> None:
         # Submitting leaves the field in its resting mode: normal mode under Vim
@@ -1053,7 +1208,7 @@ class TuiApp:
         missing = [
             path
             for path in [*self.source_paths, self.moc_hint]
-            if path is not None and not path.exists()
+            if path is not None and not path_exists(path)
         ]
         if missing:
             self.status = f"file not found: {missing[0]}"
@@ -1282,6 +1437,9 @@ class TuiApp:
             return
         if key == "\x03":  # Ctrl-C always exits, even while a worker is running.
             self.done = True
+            return
+        if isinstance(key, PasteEvent):
+            self._handle_paste(key.text)
             return
         if key == "\x1b":
             # Escape dismisses transient feedback so the header does not keep
