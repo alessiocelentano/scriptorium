@@ -12,7 +12,7 @@ from .log import Logger
 from .pipeline import Pipeline, RunOptions
 from .ui import ConsoleUI
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 def build_parser() -> argparse.ArgumentParser:
