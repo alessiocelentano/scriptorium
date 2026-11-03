@@ -119,11 +119,6 @@ def _default_artifacts_dir() -> Path:
     return root / "scriptorium"
 
 
-def _default_search_path() -> Path:
-    downloads = Path.home() / "Downloads"
-    return downloads if downloads.is_dir() else Path.home()
-
-
 def _project_config_path() -> Path | None:
     """Return the repo-local settings file when running from a source checkout."""
     if (PROJECT_ROOT / "pyproject.toml").is_file():
@@ -330,10 +325,8 @@ class Config:
             if path not in roots:
                 roots.append(path)
         object.__setattr__(self, "user_search_paths", tuple(roots))
-        # The effective roots add a default source location only when the user
-        # configured none, then always include the notes root.
-        if not roots:
-            roots.append(_default_search_path())
+        # The effective roots are exactly the configured ones plus the notes
+        # root, which is always searched.  No implicit source location is added.
         notes_root = Path(self.notes_root).expanduser()
         if notes_root not in roots:
             roots.append(notes_root)

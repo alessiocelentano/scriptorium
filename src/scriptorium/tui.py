@@ -158,6 +158,7 @@ from .tui_render import (  # noqa: F401 - styles are re-exported for tests
     STYLE_ACTIVE_BORDER,
     STYLE_ADDED,
     STYLE_DIM,
+    STYLE_ERROR,
     STYLE_FOCUS,
     STYLE_HEADING,
     STYLE_HUNK,
@@ -165,9 +166,11 @@ from .tui_render import (  # noqa: F401 - styles are re-exported for tests
     STYLE_MODE_INSERT,
     STYLE_MODE_NORMAL,
     STYLE_MODE_STANDARD,
+    STYLE_OK,
     STYLE_REMOVED,
     STYLE_SELECTED,
     STYLE_TITLE,
+    STYLE_WARN,
     Painter,
 )
 from .tui_render import clip as _clip
@@ -231,6 +234,9 @@ class WizardState:
     completion: CompletionPopup | None = None
     message: str = ""
     values: dict[str, object] = field(default_factory=dict)
+    # Set when the review page found red rows and the user is being asked to
+    # confirm that they want to save anyway.
+    confirm: bool = False
 
 
 # The settings modal and the first-run wizard share the field-editing helpers:
@@ -599,6 +605,10 @@ class TuiApp:
             STYLE_MODE_STANDARD: (curses.COLOR_BLACK, curses.COLOR_CYAN),
             STYLE_MODE_NORMAL: (curses.COLOR_BLACK, curses.COLOR_BLUE),
             STYLE_MODE_INSERT: (curses.COLOR_BLACK, curses.COLOR_GREEN),
+            # Wizard review statuses: green tick, yellow warning, red cross.
+            STYLE_OK: (curses.COLOR_GREEN, -1),
+            STYLE_WARN: (curses.COLOR_YELLOW, -1),
+            STYLE_ERROR: (curses.COLOR_RED, -1),
         }
         for index, (style, (foreground, background)) in enumerate(pairs.items(), start=1):
             try:
@@ -2106,6 +2116,7 @@ class TuiApp:
         state.list_index = -1
         state.completion = None
         state.message = ""
+        state.confirm = False
 
     def _begin_wizard_list_edit(
         self, state: WizardState, field: SettingField, row: SettingsRow
@@ -2159,7 +2170,7 @@ class TuiApp:
         except ValueError as exc:
             state.message = str(exc)
             return
-        notes_root = Path(str(state.values.get("notes_root", ""))).expanduser()
+        notes_root = Path(str(overrides["notes_root"])).expanduser()
         try:
             notes_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -2185,6 +2196,14 @@ class TuiApp:
     def _handle_wizard_key(self, key: Any) -> None:
         state = self.wizard
         if state is None:
+            return
+
+        if state.page == wizard.PAGE_REVIEW and state.confirm:
+            if key in {"y", "\n", "\r", curses.KEY_ENTER, 10, 13}:
+                self._save_wizard()
+            elif key in {"b", "n", "q", "\x1b"}:
+                state.confirm = False
+                state.message = ""
             return
 
         if state.editor is not None:
@@ -2233,7 +2252,15 @@ class TuiApp:
             return
         if state.page == wizard.PAGE_REVIEW:
             if key in {"\n", "\r", curses.KEY_ENTER, 10, 13}:
-                self._save_wizard()
+                errors = wizard.review_errors(state.values)
+                if errors:
+                    # Red rows mean the run may fail: ask before saving.  The
+                    # red rows already list the problems, so the header only
+                    # says that continuing is risky.
+                    state.confirm = True
+                    state.message = wizard.REVIEW_WARNING
+                else:
+                    self._save_wizard()
             return
 
         rows = self._wizard_rows(state)
@@ -2843,14 +2870,34 @@ class TuiApp:
             return
         field_rows = self._wizard_rows(state) if state.page != wizard.PAGE_REVIEW else []
         w = max(36, min(cols - 4, (cols * 4) // 5))
-        height_needed = max(14, len(field_rows) + 12)
+        if state.page == wizard.PAGE_REVIEW:
+            # The review prints each option plus its explanation, so size the
+            # box from the actual wrapped line count instead of a fixed guess.
+            content_w = max(1, w - 5)
+            review_lines = 0
+            for row in wizard.review(state.values):
+                review_lines += len(_wrap(f"{row.label}: {row.value}", max(1, content_w - 2)))
+                if row.detail:
+                    review_lines += len(_wrap(row.detail, max(1, content_w - 2)))
+            if state.confirm and state.message:
+                review_lines += len(_wrap(state.message, content_w)) + 1
+            elif wizard.review_errors(state.values):
+                review_lines += len(_wrap(wizard.REVIEW_WARNING, content_w)) + 1
+            height_needed = max(14, review_lines + 8)
+        else:
+            height_needed = max(14, len(field_rows) + 12)
         if state.editor is not None:
             height_needed += 1
         h = min(rows - 2, max(height_needed, rows // 2))
         y = max(1, (rows - h) // 2)
         x = max(1, (cols - w) // 2)
         if state.page == wizard.PAGE_REVIEW:
-            footer = "Enter save and start · b back"
+            if state.confirm:
+                footer = "b back · y save anyway"
+            elif wizard.review_errors(state.values):
+                footer = "Enter continue · b back"
+            else:
+                footer = "Enter save and start · b back"
         elif state.editor is not None:
             footer = "Tab complete · Enter accept · Esc cancel"
         else:
@@ -2885,9 +2932,34 @@ class TuiApp:
         display: list[list[tuple[str, str]]] = []
         selected_line = 0
         if state.page == wizard.PAGE_REVIEW:
-            for label, value in wizard.summary_rows(state.values):
-                for piece in _wrap(f"{label}: {value}", content_w):
-                    display.append([(piece, STYLE_DIM)])
+            status_styles = {
+                wizard.REVIEW_OK: STYLE_OK,
+                wizard.REVIEW_WARN: STYLE_WARN,
+                wizard.REVIEW_ERROR: STYLE_ERROR,
+            }
+            # The confirmation header sits at the top of the page as soon as a
+            # red row is present; the red rows below spell out each problem.
+            show_warning = state.confirm or bool(wizard.review_errors(state.values))
+            if show_warning:
+                for piece in _wrap(wizard.REVIEW_WARNING, content_w):
+                    display.append([(piece, STYLE_ERROR)])
+                display.append([])
+            for row in wizard.review(state.values):
+                style = status_styles.get(row.status, STYLE_DIM)
+                glyph = wizard.REVIEW_GLYPHS.get(row.status, " ")
+                # The glyph carries the status colour; the option and its value
+                # stay white so only the explanation stands out.
+                pieces = _wrap(f"{row.label}: {row.value}", max(1, content_w - 2))
+                display.append([(glyph + " ", style), (pieces[0], "normal")])
+                for piece in pieces[1:]:
+                    display.append([("  " + piece, "normal")])
+                # A warning/error explanation sits on the line right below its
+                # own option, in its own colour.  Indent after wrapping: the
+                # wrap helper trims leading whitespace.
+                if row.detail:
+                    indent = "  "
+                    for piece in _wrap(row.detail, max(1, content_w - len(indent))):
+                        display.append([(indent + piece, style)])
         else:
             # While the editor is open the hardware cursor marks the typing
             # position; keep the rows plain so no reverse-video block looks
@@ -2937,10 +3009,13 @@ class TuiApp:
                 break
             column = 0
             for text, style in display[index]:
-                self._addstr(
+                # Raw writes keep leading whitespace (indented explanations,
+                # list markers); ``_addstr`` normalises it away.
+                self.painter.addnstr_raw(
                     list_y + offset,
                     content_x + column,
                     text,
+                    len(text),
                     self._attr(style),
                 )
                 column += len(text)
@@ -2976,7 +3051,7 @@ class TuiApp:
             except curses.error:
                 pass
 
-        if state.message:
+        if state.message and not (state.page == wizard.PAGE_REVIEW and state.confirm):
             message_lines = _wrap(state.message, content_w)
             start = max(y + 1, y + h - 1 - len(message_lines))
             for offset, line in enumerate(message_lines):

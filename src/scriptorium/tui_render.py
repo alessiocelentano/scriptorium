@@ -29,6 +29,11 @@ STYLE_FOCUS = "focus"
 STYLE_MODE_STANDARD = "mode_standard"
 STYLE_MODE_NORMAL = "mode_normal"
 STYLE_MODE_INSERT = "mode_insert"
+# Status colours for the wizard review page: a green tick, a yellow warning
+# sign and a red cross, each used for the glyph and its explanation only.
+STYLE_OK = "ok"
+STYLE_WARN = "warn"
+STYLE_ERROR = "error"
 
 #: One row of pane content: the text and the style name used to draw it.
 Row = tuple[str, str]

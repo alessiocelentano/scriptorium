@@ -18,11 +18,19 @@ Two values are wizard-only and never reach ``config.toml``:
 
 from __future__ import annotations
 
+import importlib.util
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, Config
+from .config import (
+    _ASR_KEY_ENVS,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    PROJECT_ROOT,
+    Config,
+)
 from .settings import (
     KIND_CHOICE,
     KIND_LIST,
@@ -78,14 +86,15 @@ PAGES: tuple[WizardPage, ...] = (
                 "notes_root",
                 "Notes root",
                 KIND_PATH,
-                "The directory where your notes live in",
+                "Where notes are written. Created on save if missing",
                 target=PATH_DIR,
             ),
             SettingField(
                 "search_paths",
                 "Search paths",
                 KIND_LIST,
-                "Where you save your sources",
+                "Folders searched for sources (completion, MOC lookup, Extras export). "
+                "Notes root will be automatically added",
                 target=PATH_DIR,
                 must_exist=True,
             ),
@@ -106,7 +115,7 @@ PAGES: tuple[WizardPage, ...] = (
                 "llm_model",
                 "Model",
                 KIND_TEXT,
-                "Model id",
+                "Model id. Provider default if missing",
             ),
             SettingField(
                 "llm_base_url",
@@ -118,7 +127,7 @@ PAGES: tuple[WizardPage, ...] = (
                 "llm_api_key",
                 "API key",
                 KIND_PASSWORD,
-                "Your API key. Environment Variables override it",
+                "Credential for the endpoint. SCRIPTORIUM_LLM_API_KEY / LLM_API_KEY also work",
             ),
         ),
     ),
@@ -137,26 +146,29 @@ PAGES: tuple[WizardPage, ...] = (
                 "asr_mode",
                 "Transcription",
                 KIND_CHOICE,
-                "Where speech-to-text runs",
+                '"Local" downloads openai/whisper-large-v3 once and runs it here. '
+                '"Remote" calls an OpenAI-compatible /audio/transcriptions endpoint',
                 choices=_ASR_MODE_CHOICES,
             ),
             SettingField(
                 "asr_api_base_url",
                 "ASR base URL",
                 KIND_TEXT,
-                "OpenAI-compatible transcription endpoint",
+                "Endpoint base URL, e.g. https://api.groq.com/openai/v1",
             ),
             SettingField(
                 "asr_api_model",
                 "ASR model",
                 KIND_TEXT,
-                "Remote model id. Defaults to the local ASR model",
+                "Model id on that server, e.g. whisper-large-v3. "
+                "It reuses the local ASR model id if missing",
             ),
             SettingField(
                 "asr_api_key",
                 "ASR API key",
                 KIND_PASSWORD,
-                "ASR API Key. Only needed by the remote endpoint",
+                "Credential for the endpoint. SCRIPTORIUM_ASR_API_KEY, ASR_API_KEY, "
+                "OPENAI_API_KEY, GROQ_API_KEY, HF_TOKEN also work",
             ),
         ),
     ),
@@ -247,7 +259,9 @@ def wizard_to_config(
     """
     notes_root = str(values.get("notes_root", "")).strip()
     if not notes_root:
-        raise ValueError("Notes root cannot be empty")
+        # An empty value is not fatal: notes go to a well-known folder next to
+        # the app, and the review page marks this as a warning.
+        notes_root = str(PROJECT_ROOT / "notes")
     # Only the user-configured paths are written; Config adds the default
     # source root and the notes root implicitly.
     search_paths = _string_list(values.get("search_paths"))
@@ -312,30 +326,269 @@ def _asr_label(value: str) -> str:
     return value
 
 
-def summary_rows(values: Mapping[str, object]) -> list[tuple[str, str]]:
-    """Human-readable rows for the review page (never raises)."""
-    notes_root = str(values.get("notes_root", "")).strip() or "(not set)"
-    search_paths = _string_list(values.get("search_paths"))
-    provider = str(values.get("llm_provider") or LLM_DEEPSEEK)
-    model = str(values.get("llm_model", "")).strip() or "(default)"
-    base_url = str(values.get("llm_base_url", "")).strip()
-    api_key = str(values.get("llm_api_key", "")).strip()
-    language = str(values.get("language", "")).strip() or "detect"
-    asr_mode = str(values.get("asr_mode") or ASR_LOCAL)
-    asr_base_url = str(values.get("asr_api_base_url", "")).strip()
+# Review statuses, drawn as a coloured glyph on the review page.
+REVIEW_OK = "ok"
+REVIEW_WARN = "warn"
+REVIEW_ERROR = "error"
 
-    rows: list[tuple[str, str]] = [
-        ("Notes root", notes_root),
-        ("Search paths", ", ".join(search_paths) if search_paths else "(notes root)"),
-        ("Model", _provider_label(provider)),
-        ("Model id", model),
-    ]
+REVIEW_GLYPHS = {REVIEW_OK: "✓", REVIEW_WARN: "⚠", REVIEW_ERROR: "✗"}
+
+# Header shown on the review page as soon as a red row is present.
+REVIEW_WARNING = "Some settings are missing or invalid. Scriptorium may not work properly"
+
+
+def _llm_key_source(values: Mapping[str, object]) -> str:
+    """Where the LLM key comes from: ``file``, ``env`` or an empty string."""
+    if os.environ.get("SCRIPTORIUM_LLM_API_KEY", "").strip():
+        return "env"
+    if str(values.get("llm_api_key", "")).strip():
+        return "file"
+    provider = str(values.get("llm_provider") or LLM_DEEPSEEK)
+    names = ("LLM_API_KEY",) if provider == LLM_DEEPSEEK else ("LLM_API_KEY", "OPENAI_API_KEY")
+    for name in names:
+        if os.environ.get(name, "").strip():
+            return "env"
+    return ""
+
+
+def _asr_key_source(values: Mapping[str, object]) -> str:
+    """Where the transcription key comes from: ``file``, ``env`` or empty."""
+    if os.environ.get("SCRIPTORIUM_ASR_API_KEY", "").strip():
+        return "env"
+    if str(values.get("asr_api_key", "")).strip():
+        return "file"
+    for name in _ASR_KEY_ENVS:
+        if os.environ.get(name, "").strip():
+            return "env"
+    return ""
+
+
+def _local_asr_available() -> bool:
+    """True when the local speech-to-text dependencies can be imported."""
+    for name in ("torch", "transformers"):
+        try:
+            if importlib.util.find_spec(name) is None:
+                return False
+        except (ImportError, ValueError):
+            return False
+    return True
+
+
+def _local_asr_detail() -> str:
+    return "Local transcription needs torch and transformers: pip install -e '.[asr]'"
+
+
+@dataclass(frozen=True)
+class ReviewRow:
+    """One line of the review page, with a status and an optional explanation."""
+
+    label: str
+    value: str
+    status: str = REVIEW_OK
+    detail: str = ""
+
+
+def _path_exists(value: object) -> bool:
+    return Path(str(value)).expanduser().is_dir()
+
+
+def review(values: Mapping[str, object]) -> list[ReviewRow]:
+    """Classify every visible wizard value for the review page (never raises).
+
+    ``REVIEW_OK`` is a value that is set and valid, or a choice with a concrete
+    selection; ``REVIEW_WARN`` is empty but still works thanks to a default or
+    fallback; ``REVIEW_ERROR`` is empty and needed, or invalid, so the run can
+    fail.  The caller shows the errors and asks before saving.
+    """
+    rows: list[ReviewRow] = []
+    provider = str(values.get("llm_provider") or LLM_DEEPSEEK)
+    asr_mode = str(values.get("asr_mode") or ASR_LOCAL)
+
+    # Vault.
+    notes_root = str(values.get("notes_root", "")).strip()
+    if notes_root:
+        rows.append(ReviewRow("Notes root", notes_root))
+    else:
+        rows.append(
+            ReviewRow(
+                "Notes root",
+                "(not set)",
+                REVIEW_WARN,
+                'Empty: a "notes/" folder will be created next to the app',
+            )
+        )
+    search_paths = _string_list(values.get("search_paths"))
+    if not search_paths:
+        rows.append(
+            ReviewRow(
+                "Search paths",
+                "(notes root only)",
+                REVIEW_WARN,
+                "Empty: only the notes root is searched for sources",
+            )
+        )
+    else:
+        missing = [path for path in search_paths if not _path_exists(path)]
+        if missing:
+            rows.append(
+                ReviewRow(
+                    "Search paths",
+                    ", ".join(search_paths),
+                    REVIEW_ERROR,
+                    f"Folder not found: {missing[0]}",
+                )
+            )
+        else:
+            rows.append(ReviewRow("Search paths", ", ".join(search_paths)))
+
+    # Model.
+    rows.append(ReviewRow("Provider", _provider_label(provider)))
+    model = str(values.get("llm_model", "")).strip()
+    base_url = str(values.get("llm_base_url", "")).strip()
+    if model:
+        rows.append(ReviewRow("Model id", model))
+    elif provider == LLM_CUSTOM:
+        rows.append(
+            ReviewRow(
+                "Model id",
+                "(not set)",
+                REVIEW_ERROR,
+                "A custom endpoint needs a model id",
+            )
+        )
+    elif provider == LLM_OLLAMA:
+        rows.append(
+            ReviewRow(
+                "Model id",
+                f"{OLLAMA_MODEL} (default)",
+                REVIEW_WARN,
+                "Empty: uses the Ollama default model",
+            )
+        )
+    else:
+        rows.append(
+            ReviewRow(
+                "Model id",
+                f"{DEFAULT_LLM_MODEL} (default)",
+                REVIEW_WARN,
+                "Empty: uses the DeepSeek default model",
+            )
+        )
+    if provider != LLM_DEEPSEEK:
+        if base_url:
+            rows.append(ReviewRow("Base URL", base_url))
+        elif provider == LLM_OLLAMA:
+            rows.append(
+                ReviewRow(
+                    "Base URL",
+                    f"{OLLAMA_BASE_URL} (default)",
+                    REVIEW_WARN,
+                    "Empty: defaults to a local Ollama server",
+                )
+            )
+        else:
+            rows.append(
+                ReviewRow(
+                    "Base URL",
+                    "(not set)",
+                    REVIEW_ERROR,
+                    "A custom endpoint needs a base URL",
+                )
+            )
     if provider != LLM_OLLAMA:
-        rows.append(("API key", "set" if api_key else "(unset; env vars also work)"))
-    if provider != LLM_DEEPSEEK and base_url:
-        rows.append(("Base URL", base_url))
-    rows.append(("Language", language))
-    rows.append(("Transcription", _asr_label(asr_mode)))
+        key_source = _llm_key_source(values)
+        if key_source == "file":
+            rows.append(ReviewRow("API key", "set"))
+        elif key_source == "env":
+            rows.append(ReviewRow("API key", "(from environment)"))
+        elif provider == LLM_CUSTOM:
+            rows.append(
+                ReviewRow(
+                    "API key",
+                    "(not set)",
+                    REVIEW_WARN,
+                    "Optional: local servers usually need no key",
+                )
+            )
+        else:
+            rows.append(
+                ReviewRow(
+                    "API key",
+                    "(not set)",
+                    REVIEW_ERROR,
+                    "DeepSeek needs an API key",
+                )
+            )
+
+    # Speech.
+    language = str(values.get("language", "")).strip()
+    if language:
+        rows.append(ReviewRow("Language", language))
+    else:
+        rows.append(
+            ReviewRow(
+                "Language",
+                "detect (default)",
+                REVIEW_WARN,
+                "Empty: the spoken language is detected from the audio",
+            )
+        )
     if asr_mode == ASR_REMOTE:
-        rows.append(("ASR endpoint", asr_base_url or "(not set)"))
+        rows.append(ReviewRow("Transcription", _asr_label(asr_mode)))
+    elif _local_asr_available():
+        rows.append(ReviewRow("Transcription", _asr_label(asr_mode)))
+    else:
+        rows.append(
+            ReviewRow(
+                "Transcription",
+                _asr_label(asr_mode),
+                REVIEW_WARN,
+                _local_asr_detail(),
+            )
+        )
+    if asr_mode == ASR_REMOTE:
+        asr_base_url = str(values.get("asr_api_base_url", "")).strip()
+        if asr_base_url:
+            rows.append(ReviewRow("ASR endpoint", asr_base_url))
+        else:
+            rows.append(
+                ReviewRow(
+                    "ASR endpoint",
+                    "(not set)",
+                    REVIEW_ERROR,
+                    "A remote endpoint needs a base URL",
+                )
+            )
+        asr_model = str(values.get("asr_api_model", "")).strip()
+        if asr_model:
+            rows.append(ReviewRow("ASR model", asr_model))
+        else:
+            rows.append(
+                ReviewRow(
+                    "ASR model",
+                    "openai/whisper-large-v3 (default)",
+                    REVIEW_WARN,
+                    "Empty: uses the local ASR model id",
+                )
+            )
+        asr_key_source = _asr_key_source(values)
+        if asr_key_source == "file":
+            rows.append(ReviewRow("ASR API key", "set"))
+        elif asr_key_source == "env":
+            rows.append(ReviewRow("ASR API key", "(from environment)"))
+        else:
+            rows.append(
+                ReviewRow(
+                    "ASR API key",
+                    "(not set)",
+                    REVIEW_WARN,
+                    "Most endpoints need a key: set SCRIPTORIUM_ASR_API_KEY or "
+                    "ASR_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, HF_TOKEN",
+                )
+            )
     return rows
+
+
+def review_errors(values: Mapping[str, object]) -> list[ReviewRow]:
+    """The review rows that would make the run fail (red)."""
+    return [row for row in review(values) if row.status == REVIEW_ERROR]

@@ -33,7 +33,7 @@ class ConfigSettingsTests(unittest.TestCase):
         values.update(overrides)
         return Config(**values)  # type: ignore[arg-type]
 
-    def test_search_paths_default_to_downloads(self):
+    def test_search_paths_are_exactly_what_was_configured(self):
         config = self.config(search_paths=(self.vault,))
         self.assertEqual(config.search_paths, (self.vault,))
 
@@ -50,7 +50,8 @@ class ConfigSettingsTests(unittest.TestCase):
     def test_user_search_paths_is_empty_when_nothing_was_configured(self):
         config = self.config()
         self.assertEqual(config.user_search_paths, ())
-        self.assertEqual(config.search_paths[-1], self.vault)
+        # Nothing is added implicitly apart from the notes root.
+        self.assertEqual(config.search_paths, (self.vault,))
 
     def test_language_detect_leaves_the_language_empty(self):
         self.assertEqual(self.config(language="detect").language, "")
@@ -260,9 +261,7 @@ class LoadConfigTests(unittest.TestCase):
         )
         with mock.patch.dict(os.environ, env, clear=True):
             config = load_config()
-        self.assertEqual(
-            config.search_paths, (self.root / "a", self.root / "b", self.vault)
-        )
+        self.assertEqual(config.search_paths, (self.root / "a", self.root / "b", self.vault))
 
     def test_warning_codes_are_serialized_as_a_list(self):
         with mock.patch.dict(os.environ, self.env, clear=True):

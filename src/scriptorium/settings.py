@@ -104,7 +104,7 @@ SECTIONS: tuple[SettingSection, ...] = (
                 "notes_root",
                 "Notes root",
                 KIND_PATH,
-                "Every note write is confined here",
+                "Every note write is confined here. Created on save if missing",
                 target=PATH_DIR,
                 must_exist=True,
             ),
@@ -119,7 +119,8 @@ SECTIONS: tuple[SettingSection, ...] = (
                 "search_paths",
                 "Search paths",
                 KIND_LIST,
-                "File completion, Extras export and MOC lookup",
+                "Folders searched for sources (completion, MOC lookup, Extras export). "
+                "Notes root will be automatically added",
                 target=PATH_DIR,
                 must_exist=True,
             ),
@@ -143,7 +144,12 @@ SECTIONS: tuple[SettingSection, ...] = (
         "model",
         "Model",
         (
-            SettingField("llm_model", "LLM model", KIND_TEXT, "Model id for planning and vision"),
+            SettingField(
+                "llm_model",
+                "LLM model",
+                KIND_TEXT,
+                "Model id. Provider default if missing",
+            ),
             SettingField(
                 "llm_base_url",
                 "LLM base URL",
@@ -154,7 +160,7 @@ SECTIONS: tuple[SettingSection, ...] = (
                 "llm_api_key",
                 "LLM API key",
                 KIND_PASSWORD,
-                "Stored in config.toml; env vars override it",
+                "Credential for the endpoint. SCRIPTORIUM_LLM_API_KEY / LLM_API_KEY also work",
             ),
             SettingField(
                 "llm_timeout",
@@ -190,13 +196,15 @@ SECTIONS: tuple[SettingSection, ...] = (
                 "asr_api_base_url",
                 "ASR base URL",
                 KIND_TEXT,
-                "Empty runs the local pipeline; set it for a remote endpoint",
+                "Endpoint base URL, e.g. https://api.groq.com/openai/v1. "
+                "Empty runs the local pipeline",
             ),
             SettingField(
                 "asr_api_model",
                 "ASR API model",
                 KIND_TEXT,
-                "Remote model id; defaults to the ASR model",
+                "Model id on that server, e.g. whisper-large-v3. "
+                "It reuses the local ASR model id if missing",
             ),
             SettingField(
                 "asr_api_protocol",
@@ -212,7 +220,8 @@ SECTIONS: tuple[SettingSection, ...] = (
                 "asr_api_key",
                 "ASR API key",
                 KIND_PASSWORD,
-                "For a remote endpoint; env vars override it",
+                "Credential for the endpoint. SCRIPTORIUM_ASR_API_KEY, ASR_API_KEY, "
+                "OPENAI_API_KEY, GROQ_API_KEY, HF_TOKEN also work",
             ),
             SettingField(
                 "asr_api_timeout",

@@ -163,9 +163,84 @@ class WizardSchemaTests(unittest.TestCase):
         self.assertEqual(file_values["language"], "detect")
 
     def test_summary_never_raises_on_empty_values(self):
-        rows = wizard.summary_rows({})
+        rows = wizard.review({})
         self.assertTrue(rows)
-        self.assertTrue(any(label == "Notes root" for label, _ in rows))
+        self.assertTrue(any(row.label == "Notes root" for row in rows))
+
+    def test_an_empty_notes_root_falls_back_to_the_app_notes_folder(self):
+        file_values, overrides = wizard.wizard_to_config(_values(notes_root=""))
+        self.assertEqual(file_values["notes_root"], str(wizard.PROJECT_ROOT / "notes"))
+        self.assertEqual(overrides["notes_root"], wizard.PROJECT_ROOT / "notes")
+
+    def test_review_marks_an_empty_notes_root_as_a_warning(self):
+        row = next(
+            row for row in wizard.review(_values(notes_root="")) if row.label == "Notes root"
+        )
+        self.assertEqual(row.status, wizard.REVIEW_WARN)
+        self.assertIn("notes/", row.detail)
+
+    def test_review_marks_empty_search_paths_as_a_warning(self):
+        row = next(
+            row for row in wizard.review(_values(search_paths=[])) if row.label == "Search paths"
+        )
+        self.assertEqual(row.status, wizard.REVIEW_WARN)
+        self.assertIn("notes root", row.detail)
+
+    def test_review_flags_a_missing_search_folder_as_an_error(self):
+        row = next(
+            row
+            for row in wizard.review(_values(search_paths=["/definitely/not/here"]))
+            if row.label == "Search paths"
+        )
+        self.assertEqual(row.status, wizard.REVIEW_ERROR)
+        self.assertIn("/definitely/not/here", row.detail)
+
+    def test_review_errors_when_deepseek_has_no_api_key(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            row = next(
+                row for row in wizard.review(_values(llm_api_key="")) if row.label == "API key"
+            )
+        self.assertEqual(row.status, wizard.REVIEW_ERROR)
+        self.assertEqual(row.detail, "DeepSeek needs an API key")
+
+    def test_review_accepts_an_api_key_from_the_environment(self):
+        with mock.patch.dict("os.environ", {"SCRIPTORIUM_LLM_API_KEY": "k"}):
+            row = next(
+                row for row in wizard.review(_values(llm_api_key="")) if row.label == "API key"
+            )
+        self.assertEqual(row.status, wizard.REVIEW_OK)
+        self.assertEqual(row.value, "(from environment)")
+
+    def test_review_marks_a_missing_custom_endpoint_as_an_error(self):
+        values = _values(
+            llm_provider=wizard.LLM_CUSTOM,
+            llm_model="",
+            llm_base_url="",
+            llm_api_key="",
+        )
+        rows = {row.label: row for row in wizard.review(values)}
+        self.assertEqual(rows["Model id"].status, wizard.REVIEW_ERROR)
+        self.assertEqual(rows["Base URL"].status, wizard.REVIEW_ERROR)
+        self.assertEqual(rows["API key"].status, wizard.REVIEW_WARN)
+
+    def test_review_marks_remote_transcription_without_a_base_url_as_an_error(self):
+        rows = {row.label: row for row in wizard.review(_values(asr_mode=wizard.ASR_REMOTE))}
+        self.assertEqual(rows["ASR endpoint"].status, wizard.REVIEW_ERROR)
+        self.assertEqual(rows["ASR model"].status, wizard.REVIEW_WARN)
+        self.assertEqual(rows["ASR API key"].status, wizard.REVIEW_WARN)
+
+    def test_review_defaults_are_warnings_not_errors(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            rows = {
+                row.label: row
+                for row in wizard.review(
+                    _values(llm_model="", language="", search_paths=[], llm_api_key="k")
+                )
+            }
+        self.assertEqual(rows["Model id"].status, wizard.REVIEW_WARN)
+        self.assertEqual(rows["Language"].status, wizard.REVIEW_WARN)
+        with mock.patch.object(wizard, "_path_exists", return_value=True):
+            self.assertEqual(wizard.review_errors(_values(llm_api_key="k")), [])
 
     def test_default_values_leave_search_paths_empty(self):
         config = Config(
@@ -289,6 +364,7 @@ class WizardTuiTests(unittest.TestCase):
         assert state is not None
         new_root = self.root / "new-vault"
         state.values["notes_root"] = str(new_root)
+        state.values["llm_api_key"] = "secret"
         for _ in range(3):
             app._handle_wizard_key("\t")
         self.assertEqual(state.page, wizard.PAGE_REVIEW)
@@ -299,6 +375,53 @@ class WizardTuiTests(unittest.TestCase):
         self.assertEqual(self.written["notes_root"], str(new_root))
         self.assertEqual(self.written["llm_base_url"], "https://api.deepseek.com")
         self.mark_mock.assert_called_once()
+
+    def test_review_page_asks_before_saving_red_settings(self):
+        app = self._app()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            for _ in range(3):
+                app._handle_wizard_key("\t")
+            app._handle_wizard_key("\n")
+            self.assertIsNotNone(app.wizard)
+            self.assertTrue(state.confirm)
+            self.assertIn("may not work properly", state.message)
+            self.assertEqual(self.written, {})
+            self.mark_mock.assert_not_called()
+
+    def test_confirming_with_y_saves_anyway(self):
+        app = self._app()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            for _ in range(3):
+                app._handle_wizard_key("\t")
+            app._handle_wizard_key("\n")
+            app._handle_wizard_key("y")
+        self.assertIsNone(app.wizard)
+        self.mark_mock.assert_called_once()
+
+    def test_back_from_the_confirmation_cancels_without_saving(self):
+        app = self._app()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            for _ in range(3):
+                app._handle_wizard_key("\t")
+            app._handle_wizard_key("\n")
+            app._handle_wizard_key("b")
+        self.assertIsNotNone(app.wizard)
+        self.assertFalse(state.confirm)
+        self.assertEqual(state.message, "")
+        self.assertEqual(self.written, {})
+        self.mark_mock.assert_not_called()
 
     def test_skip_key_no_longer_closes_the_wizard(self):
         app = self._app()
@@ -350,7 +473,7 @@ class WizardTuiTests(unittest.TestCase):
         app._draw()
         lines = self._draw_lines(app)
         notes_index = next(index for index, line in enumerate(lines) if "Notes root" in line)
-        self.assertIn("The directory where your notes live in", lines[notes_index + 1])
+        self.assertIn("Where notes are written. Created on save if missing", lines[notes_index + 1])
         self.assertEqual(lines[notes_index + 2].strip("║ "), "")
         self.assertIn("Search paths", lines[notes_index + 3])
 
@@ -359,7 +482,7 @@ class WizardTuiTests(unittest.TestCase):
         app.open_setup_wizard()
         app._draw()
         text = "\n".join(self._draw_lines(app))
-        self.assertEqual(text.count("Where you save your sources"), 1)
+        self.assertEqual(text.count("Folders searched for sources"), 1)
         self.assertIn("+ add another search path", text)
 
     def test_the_add_row_opens_the_editor_for_a_new_search_path(self):
@@ -436,8 +559,40 @@ class WizardTuiTests(unittest.TestCase):
         state.page = wizard.PAGE_REVIEW
         app._handle_wizard_key("\n")
         self.assertIsNotNone(app.wizard)
-        self.assertIn("base URL", state.message)
+        self.assertTrue(state.confirm)
+        self.assertIn("may not work properly", state.message)
+        # The problem itself is spelled out by the red review rows.
+        details = [row.detail for row in wizard.review_errors(state.values)]
+        self.assertTrue(any("base URL" in detail for detail in details))
         self.assertEqual(self.written, {})
+
+    def test_the_confirmation_header_is_drawn_before_enter_on_red_rows(self):
+        app = self._app()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            state.page = wizard.PAGE_REVIEW
+            app._draw()
+        lines = self._draw_lines(app)
+        header = next(i for i, line in enumerate(lines) if "may not work properly" in line)
+        first_row = next(i for i, line in enumerate(lines) if "Notes root" in line)
+        self.assertLess(header, first_row)
+
+    def test_review_problem_descriptions_are_indented(self):
+        app = self._app()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            state.page = wizard.PAGE_REVIEW
+            app._draw()
+        line = next(line for line in self._draw_lines(app) if "DeepSeek needs an API key" in line)
+        content = line.split("║", 2)[1]
+        # Two border-padding cells plus the two-cell indent under the glyph.
+        self.assertTrue(content.startswith("    DeepSeek needs an API key"))
 
 
 if __name__ == "__main__":
