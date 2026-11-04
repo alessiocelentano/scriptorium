@@ -56,6 +56,11 @@ def _add_pipeline_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--asr-api-model", help="Model id for the transcription API")
     parser.add_argument("--asr-api-base-url", help="Base URL of the transcription API")
     parser.add_argument(
+        "--asr-rpm",
+        type=int,
+        help="Transcription API requests per minute (default: 0, send every request at once)",
+    )
+    parser.add_argument(
         "--device", choices=["auto", "mps", "cuda", "cpu"], help="Torch device for ASR"
     )
     parser.add_argument("--model", help="LLM model id")
@@ -156,6 +161,7 @@ def _pipeline_context(args: argparse.Namespace) -> tuple[Config, ConsoleUI, Logg
         asr_model=args.asr_model,
         asr_api_model=args.asr_api_model,
         asr_api_base_url=args.asr_api_base_url,
+        asr_api_rpm=args.asr_rpm,
         device=args.device,
         llm_model=args.model,
         llm_base_url=args.llm_base_url,

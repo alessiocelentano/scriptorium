@@ -24,6 +24,9 @@ class Logger:
         self.verbose = verbose
         self.sink = sink
         self._lock = threading.Lock()
+        # Console lines come from pipeline worker threads too: printing text and
+        # newline in one locked block keeps them from interleaving.
+        self._print_lock = threading.Lock()
         if logfile is not None:
             logfile.parent.mkdir(parents=True, exist_ok=True)
 
@@ -52,7 +55,8 @@ class Logger:
             self.sink(line)
             return
         stream = stream or sys.stdout
-        print(line, file=stream, flush=True)
+        with self._print_lock:
+            print(line, file=stream, flush=True)
 
     # -- public -------------------------------------------------------------- #
 

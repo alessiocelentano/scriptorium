@@ -554,38 +554,35 @@ class Pipeline:
             self.logger.info("no media sources; nothing to transcribe")
             return
 
-        transcriber: LocalTranscriber | ApiTranscriber | None = None
-        transcripts: list[tuple[SourceFile, Transcript]] = []
+        transcripts: dict[str, Transcript] = {}
+        pending: list[SourceFile] = []
         for source in media:
             transcript_path = self.store.artifact(
                 state.job_id, f"sources/{source.id}/transcript.json"
             )
             if transcript_path.is_file():
-                transcript = Transcript.model_validate_json(
+                transcripts[source.id] = Transcript.model_validate_json(
                     transcript_path.read_text(encoding="utf-8")
                 )
                 self.logger.info(f"{source.name}: reusing transcript artifact")
-            else:
-                audio_path = self.store.artifact(state.job_id, f"sources/{source.id}/audio.mp3")
-                if not audio_path.is_file():
-                    raise StageError(f"audio artifact missing for {source.name}")
-                if transcriber is None:
-                    transcriber = self._transcriber()
-                transcript = transcriber.transcribe(audio_path, prompt=self._bias_prompt(state))
-                self._write_json(transcript_path, transcript.model_dump_json(indent=2))
-            self._write_text(
-                self.store.artifact(state.job_id, f"sources/{source.id}.txt"),
-                transcript.timed_text() + "\n",
-            )
-            transcripts.append((source, transcript))
+                continue
+            audio_path = self.store.artifact(state.job_id, f"sources/{source.id}/audio.mp3")
+            if not audio_path.is_file():
+                raise StageError(f"audio artifact missing for {source.name}")
+            pending.append(source)
+
+        if pending:
+            self._transcribe_pending(state, pending, transcripts)
 
         combined = "\n\n".join(
-            f"# {source.name}\n{transcript.timed_text()}" for source, transcript in transcripts
+            f"# {source.name}\n{transcripts[source.id].timed_text()}"
+            for source in media
+            if source.id in transcripts
         )
         self._write_text(self.store.artifact(state.job_id, "02.transcript.txt"), combined + "\n")
         state.artifacts["transcript"] = "02.transcript.txt"
-        if len(transcripts) == 1:
-            _, transcript = transcripts[0]
+        if len(media) == 1 and media[0].id in transcripts:
+            transcript = transcripts[media[0].id]
             self._write_json(
                 self.store.artifact(state.job_id, "02.transcript.json"),
                 transcript.model_dump_json(indent=2),
@@ -596,6 +593,67 @@ class Pipeline:
             state.artifacts["transcript_json"] = "02.transcript.json"
             state.artifacts["srt"] = "02.transcript.srt"
         self.store.save(state)
+
+    def _transcribe_pending(
+        self, state: JobState, pending: list[SourceFile], transcripts: dict[str, Transcript]
+    ) -> None:
+        """Transcribe the sources without an artifact; write what succeeds.
+
+        The transcriber owns the request budget and the workers never touch the
+        job: they return transcripts and the artifacts are written here, in
+        source order, so a concurrent backend cannot interleave two files.
+        """
+        finished: set[str] = set()
+        paths = {source.id: str(source.path) for source in pending}
+
+        def on_progress(source_id: str, *, state: str, done: int, total: int) -> None:
+            if state in {"done", "failed"}:
+                finished.add(source_id)
+            self._emit(
+                "source_progress",
+                source_id=source_id,
+                path=paths.get(source_id, ""),
+                state=state,
+                done=done,
+                total=total,
+                sources_done=len(finished),
+                sources_total=len(pending),
+            )
+
+        batch = self._transcriber().transcribe_many(
+            [
+                (source.id, self.store.artifact(state.job_id, f"sources/{source.id}/audio.mp3"))
+                for source in pending
+            ],
+            prompt=self._bias_prompt(state),
+            on_progress=on_progress,
+        )
+
+        for source in pending:
+            transcript = batch.transcripts.get(source.id)
+            if transcript is None:
+                continue
+            transcripts[source.id] = transcript
+            self._write_json(
+                self.store.artifact(state.job_id, f"sources/{source.id}/transcript.json"),
+                transcript.model_dump_json(indent=2),
+            )
+            self._write_text(
+                self.store.artifact(state.job_id, f"sources/{source.id}.txt"),
+                transcript.timed_text() + "\n",
+            )
+
+        if batch.failures:
+            names = {source.id: source.name for source in pending}
+            detail = "; ".join(
+                f"{names.get(source_id, source_id)} ({reason})"
+                for source_id, reason in batch.failures.items()
+            )
+            raise StageError(
+                f"transcription failed for {len(batch.failures)} source(s): {detail}. "
+                "The other transcripts are saved; `scriptorium resume` retries only "
+                "the missing ones"
+            )
 
     def _extract(self, state: JobState) -> None:
         texts = self._text_sources(state)

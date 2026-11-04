@@ -7,11 +7,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,10 @@ USER_AGENT = f"scriptorium/{__version__}"
 API_UPLOAD_LIMIT_BYTES = 24 * 1024 * 1024
 API_CHUNK_SECONDS = 1200.0
 
+# Hard ceiling on concurrent uploads.  ``asr_api_rpm`` paces the requests; this
+# only stops a generous allowance from opening hundreds of sockets at once.
+MAX_IN_FLIGHT = 16
+
 
 @dataclass
 class AsrSettings:
@@ -51,6 +58,93 @@ class AsrSettings:
     api_key: str = ""
     api_timeout: float = DEFAULT_ASR_API_TIMEOUT
     api_max_bytes: int = API_UPLOAD_LIMIT_BYTES
+    # Requests per minute toward the API; zero sends every request as soon as a
+    # worker is free.
+    api_rpm: int = 0
+
+
+@dataclass
+class TranscribeBatch:
+    """Transcripts by source id, plus the sources that could not be transcribed."""
+
+    transcripts: dict[str, Transcript] = field(default_factory=dict)
+    failures: dict[str, str] = field(default_factory=dict)
+
+    def ok(self) -> bool:
+        return not self.failures
+
+
+class _RateLimiter:
+    """Token bucket pacing the requests sent to the transcription API.
+
+    ``rpm`` tokens refill over a minute, so a burst up to ``rpm`` requests goes
+    out immediately and the rest wait one token at a time.  Zero disables the
+    pacing: the caller is then bounded only by its worker count.
+    """
+
+    def __init__(
+        self,
+        rpm: int,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self.rpm = max(0, int(rpm))
+        self._clock = clock
+        self._sleep = sleep
+        self._interval = 60.0 / self.rpm if self.rpm else 0.0
+        self._tokens = float(self.rpm)
+        self._updated = clock()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Take one request slot, sleeping until a token is available."""
+        while True:
+            with self._lock:
+                if not self.rpm:
+                    return
+                now = self._clock()
+                self._tokens = min(
+                    float(self.rpm),
+                    self._tokens + max(0.0, now - self._updated) / self._interval,
+                )
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) * self._interval
+            self._sleep(wait)
+
+    def estimate(self, requests: int) -> float:
+        """Seconds a burst of ``requests`` spends waiting, ignoring the network."""
+        if not self.rpm or requests <= self.rpm:
+            return 0.0
+        return (requests - self.rpm) * self._interval
+
+
+@dataclass(frozen=True)
+class _ChunkRequest:
+    """One upload: a whole audio file, or one piece of a split one."""
+
+    source_id: str
+    name: str
+    index: int
+    total: int
+    path: Path
+    duration: float
+
+
+@dataclass(frozen=True)
+class _ChunkResult:
+    """The segments returned for one :class:`_ChunkRequest`."""
+
+    request: _ChunkRequest
+    segments: list[Segment]
+    language: str
+
+
+#: ``source id, state, chunks done, chunks total``.
+ProgressCallback = Callable[..., None]
 
 
 class LocalTranscriber:
@@ -168,6 +262,34 @@ class LocalTranscriber:
         )
         return transcript
 
+    def transcribe_many(
+        self,
+        audios: Sequence[tuple[str, Path]],
+        *,
+        prompt: str | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> TranscribeBatch:
+        """Transcribe the sources one after the other on the local model.
+
+        A local pipeline keeps the whole model in one process and its own batch
+        already fills the device, so extra workers would only fight for the
+        same GPU or CPU.  Only the API backend overlaps its requests.
+        """
+        batch = TranscribeBatch()
+        for source_id, audio in audios:
+            if on_progress is not None:
+                on_progress(source_id, state="running", done=0, total=1)
+            try:
+                batch.transcripts[source_id] = self.transcribe(audio, prompt=prompt)
+            except Exception as exc:
+                batch.failures[source_id] = str(exc)
+                if on_progress is not None:
+                    on_progress(source_id, state="failed", done=0, total=1)
+                continue
+            if on_progress is not None:
+                on_progress(source_id, state="done", done=1, total=1)
+        return batch
+
     def _prompt_ids(self, pipe: Any, prompt: str | None) -> Any | None:
         if not prompt:
             return None
@@ -234,55 +356,185 @@ class ApiTranscriber:
         self.logger = logger
 
     def transcribe(self, audio: Path, *, prompt: str | None = None) -> Transcript:
+        """Transcribe one audio file; :meth:`transcribe_many` handles several."""
+        batch = self.transcribe_many([("", audio)], prompt=prompt)
+        if "" in batch.transcripts:
+            return batch.transcripts[""]
+        raise TranscribeError(batch.failures.get("", "transcription failed"))
+
+    def transcribe_many(
+        self,
+        audios: Sequence[tuple[str, Path]],
+        *,
+        prompt: str | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> TranscribeBatch:
+        """Transcribe several audios with one shared request budget.
+
+        Every upload enters a single queue: the pieces of one source and the
+        pieces of the next are sent together and reassembled by source id
+        afterwards, so a slow episode never blocks the one after it.  The
+        ``api_rpm`` token bucket paces the queue as a whole; ``MAX_IN_FLIGHT``
+        caps the sockets.  A failed source keeps its name in ``failures`` and
+        never stops the others.
+        """
+        if not audios:
+            return TranscribeBatch()
         if not self.settings.api_key:
             raise TranscribeError(
                 "api transcription needs SCRIPTORIUM_ASR_API_KEY or OPENAI_API_KEY"
             )
         timer = Timer()
-        self.logger.step(f"transcribing {audio.name} via {self.settings.api_base_url}")
-
+        limiter = _RateLimiter(self.settings.api_rpm)
+        self.logger.step(f"transcribing {len(audios)} source(s) via {self.settings.api_base_url}")
         with tempfile.TemporaryDirectory(prefix="scriptorium-asr-") as temporary:
-            chunks = self._chunks(audio, Path(temporary))
-            segments: list[Segment] = []
-            offset = 0.0
-            duration = 0.0
-            language = self.settings.language
-            for index, chunk in enumerate(chunks, start=1):
-                chunk_duration = _media_duration(chunk)
-                if len(chunks) > 1:
-                    self.logger.info(f"chunk {index}/{len(chunks)}: {chunk.name}")
-                payload = self._request(chunk, prompt)
-                chunk_segments = _segments_from_payload(payload)
-                for segment in chunk_segments:
-                    segments.append(
-                        Segment(
-                            start=segment.start + offset,
-                            end=segment.end + offset,
-                            text=segment.text,
-                        )
-                    )
-                offset += chunk_duration or (chunk_segments[-1].end if chunk_segments else 0.0)
-                duration = max(duration, offset)
-                if not language:
-                    language = str(payload.get("language") or "")
+            requests, batch = self._plan(audios, Path(temporary))
+            self._log_plan(len(requests), len(audios), limiter)
+            results = self._dispatch(requests, prompt, limiter, on_progress, batch)
+        self._assemble(audios, results, batch)
 
-        if not segments:
-            raise TranscribeError("the ASR API returned an empty transcript")
-
-        transcript = Transcript(language=language, duration=duration, segments=segments)
-        self.logger.success(
-            f"transcribed {len(transcript.segments)} segments in {timer.human()} "
-            f"({len(transcript.text.split())} words)"
-        )
+        if batch.transcripts:
+            segments = sum(len(item.segments) for item in batch.transcripts.values())
+            words = sum(len(item.text.split()) for item in batch.transcripts.values())
+            self.logger.success(
+                f"transcribed {len(batch.transcripts)} source(s) in {timer.human()} "
+                f"({segments} segments, {words} words)"
+            )
         self.logger.event(
             "asr",
             backend="api",
             model=self.settings.api_model,
-            segments=len(transcript.segments),
-            words=len(transcript.text.split()),
+            sources=len(batch.transcripts),
+            failed=len(batch.failures),
+            requests=len(requests),
+            rpm=self.settings.api_rpm,
+            words=sum(len(item.text.split()) for item in batch.transcripts.values()),
             seconds=round(timer.elapsed, 1),
         )
-        return transcript
+        return batch
+
+    # -- planning ------------------------------------------------------------ #
+
+    def _plan(
+        self, audios: Sequence[tuple[str, Path]], root: Path
+    ) -> tuple[list[_ChunkRequest], TranscribeBatch]:
+        """Split every audio that exceeds the upload limit and list the uploads."""
+        requests: list[_ChunkRequest] = []
+        batch = TranscribeBatch()
+        for position, (source_id, audio) in enumerate(audios):
+            directory = root / f"{position:03d}"
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                chunks = self._chunks(audio, directory)
+            except (TranscribeError, OSError) as exc:
+                batch.failures[source_id] = str(exc)
+                self.logger.error(f"{audio.name}: {exc}")
+                continue
+            for index, chunk in enumerate(chunks, start=1):
+                requests.append(
+                    _ChunkRequest(
+                        source_id=source_id,
+                        name=audio.name,
+                        index=index,
+                        total=len(chunks),
+                        path=chunk,
+                        duration=_media_duration(chunk),
+                    )
+                )
+        return requests, batch
+
+    def _log_plan(self, requests: int, sources: int, limiter: _RateLimiter) -> None:
+        detail = f"{sources} source(s), {requests} request(s)"
+        if self.settings.api_rpm:
+            detail += f", {self.settings.api_rpm} rpm"
+        waiting = limiter.estimate(requests)
+        if waiting >= 1:
+            detail += f", about {int(waiting)}s of rate-limit waiting"
+        self.logger.info(detail)
+
+    # -- dispatch ------------------------------------------------------------ #
+
+    def _dispatch(
+        self,
+        requests: Sequence[_ChunkRequest],
+        prompt: str | None,
+        limiter: _RateLimiter,
+        on_progress: ProgressCallback | None,
+        batch: TranscribeBatch,
+    ) -> list[_ChunkResult]:
+        """Send every upload, paced by ``limiter``, and collect the answers."""
+        if not requests:
+            return []
+        results: list[_ChunkResult] = []
+        done: dict[str, int] = {}
+        workers = max(1, min(len(requests), MAX_IN_FLIGHT))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scriptorium-asr") as pool:
+            futures = {
+                pool.submit(self._upload, request, prompt, limiter): request for request in requests
+            }
+            for future in as_completed(futures):
+                request = futures[future]
+                try:
+                    segments, language = future.result()
+                except Exception as exc:
+                    # One upload can fail without losing the other sources.
+                    batch.failures.setdefault(request.source_id, str(exc))
+                    self.logger.error(f"{request.name}: {exc}")
+                    if on_progress is not None:
+                        on_progress(
+                            request.source_id,
+                            state="failed",
+                            done=done.get(request.source_id, 0),
+                            total=request.total,
+                        )
+                    continue
+                results.append(_ChunkResult(request=request, segments=segments, language=language))
+                done[request.source_id] = done.get(request.source_id, 0) + 1
+                if on_progress is not None:
+                    finished = done[request.source_id] == request.total
+                    on_progress(
+                        request.source_id,
+                        state="done" if finished else "running",
+                        done=done[request.source_id],
+                        total=request.total,
+                    )
+        return results
+
+    def _upload(
+        self, request: _ChunkRequest, prompt: str | None, limiter: _RateLimiter
+    ) -> tuple[list[Segment], str]:
+        """Wait for a request slot, upload one chunk, return its segments."""
+        limiter.acquire()
+        if request.total > 1:
+            self.logger.info(f"{request.name}: chunk {request.index}/{request.total}")
+        payload = self._request(request.path, prompt)
+        return _segments_from_payload(payload), str(payload.get("language") or "")
+
+    # -- reassembly ---------------------------------------------------------- #
+
+    def _assemble(
+        self,
+        audios: Sequence[tuple[str, Path]],
+        results: Sequence[_ChunkResult],
+        batch: TranscribeBatch,
+    ) -> None:
+        """Rebuild one transcript per source, in chunk order, with shifted times."""
+        grouped: dict[str, list[_ChunkResult]] = {}
+        for result in results:
+            grouped.setdefault(result.request.source_id, []).append(result)
+        for source_id, _audio in audios:
+            if source_id in batch.failures:
+                continue
+            chunks = sorted(grouped.get(source_id, []), key=lambda item: item.request.index)
+            if not chunks:
+                continue
+            language = next(
+                (item.language for item in chunks if item.language), self.settings.language
+            )
+            try:
+                batch.transcripts[source_id] = _join_chunks(chunks, language)
+            except TranscribeError as exc:
+                batch.failures[source_id] = str(exc)
 
     # -- request ------------------------------------------------------------- #
 
@@ -416,7 +668,7 @@ class ApiTranscriber:
             raise TranscribeError(
                 f"{audio.name} is {size // (1024 * 1024)} MB, above the API upload "
                 "limit, and ffmpeg is not available to split it. Install ffmpeg or "
-                'clear asr_api_base_url to run the local speech-to-text model'
+                "clear asr_api_base_url to run the local speech-to-text model"
             )
 
         duration = _media_duration(audio)
@@ -492,6 +744,33 @@ def _segments_from_payload(payload: dict[str, Any]) -> list[Segment]:
             duration = _as_float(payload.get("duration"), 0.0)
             segments.append(Segment(start=0.0, end=duration, text=text))
     return segments
+
+
+def _join_chunks(chunks: Sequence[_ChunkResult], language: str) -> Transcript:
+    """Stitch the chunks of one source back into a single timeline.
+
+    Chunks are joined in index order, not in the order their answers arrived,
+    so the transcript is identical to a sequential run.  A chunk whose probe
+    returned no duration advances the timeline by its last segment end, the
+    same fallback the sequential implementation used.
+    """
+    segments: list[Segment] = []
+    offset = 0.0
+    duration = 0.0
+    for chunk in chunks:
+        for segment in chunk.segments:
+            segments.append(
+                Segment(
+                    start=segment.start + offset,
+                    end=segment.end + offset,
+                    text=segment.text,
+                )
+            )
+        offset += chunk.request.duration or (chunk.segments[-1].end if chunk.segments else 0.0)
+        duration = max(duration, offset)
+    if not segments:
+        raise TranscribeError("the ASR API returned an empty transcript")
+    return Transcript(language=language, duration=duration, segments=segments)
 
 
 def _multipart_body(fields: dict[str, str], file_field: str, path: Path) -> tuple[bytes, str]:

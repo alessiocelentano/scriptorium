@@ -191,7 +191,7 @@ by `tui.TuiApp`).  It is the complete surface a pane may touch.
 ```
 config        focus        active       fullscreen   status
 completion    merge_review settings     modal
-source_paths  source_index source_scroll moc_hint
+source_paths  source_index source_scroll source_status moc_hint
 diff_entries  diff_index   diff_scroll  card_groups  card_index  card_scroll
 asides        extras_scroll
 log_lines     log_scroll

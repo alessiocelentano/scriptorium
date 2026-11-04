@@ -98,6 +98,12 @@ asr_model = "openai/whisper-large-v3"
 # asr_api_protocol = "openai" # openai | huggingface
 # asr_api_key = ""
 asr_api_timeout = 600.0
+# Requests per minute toward the transcription API.  The sources and the chunks
+# of one long recording share a single budget: a burst up to this many requests
+# leaves at once and the rest wait for the next token.  0 sends every request as
+# soon as it is ready and leaves the pacing to the provider (429 answers are
+# retried with a backoff).
+asr_api_rpm = 0
 device = "auto"
 batch_size = 8
 

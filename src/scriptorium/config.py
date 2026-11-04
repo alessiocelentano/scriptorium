@@ -34,6 +34,12 @@ DEFAULT_ASR_MODEL = "openai/whisper-large-v3"
 # the audio to that remote endpoint.
 DEFAULT_ASR_API_TIMEOUT = 600.0
 
+# Requests per minute toward the transcription API.  Zero means "send each
+# request as soon as it is ready" and leaves the pacing to the provider; a
+# non-zero value makes a burst up to that many requests leave at once and the
+# rest wait one token at a time.
+DEFAULT_ASR_API_RPM = 0
+
 # Request style of the transcription endpoint.  OpenAI, Groq and most
 # compatible services accept multipart /audio/transcriptions; the Hugging Face
 # router and Inference Endpoints take a raw audio body at models/<model>.
@@ -190,6 +196,7 @@ class Config:
     asr_api_base_url: str = ""
     asr_api_protocol: str = ""
     asr_api_timeout: float = DEFAULT_ASR_API_TIMEOUT
+    asr_api_rpm: int = DEFAULT_ASR_API_RPM
     asr_api_key: str = ""
     language: str = "en"
     device: str = "auto"
@@ -249,6 +256,8 @@ class Config:
             raise ConfigurationError(
                 f"asr_api_timeout must be positive, got {self.asr_api_timeout}"
             )
+        if self.asr_api_rpm < 0:
+            raise ConfigurationError(f"asr_api_rpm must be zero or more, got {self.asr_api_rpm}")
         if self.image_input not in IMAGE_INPUT_MODES:
             raise ConfigurationError(
                 "image_input must be one of "
@@ -455,6 +464,13 @@ def load_config(*, require_notes_root: bool = True, **overrides: object) -> Conf
         asr_api_key=str(
             os.environ.get("SCRIPTORIUM_ASR_API_KEY") or data.get("asr_api_key") or ""
         ).strip(),
+        asr_api_rpm=int(
+            str(
+                os.environ.get("SCRIPTORIUM_ASR_API_RPM")
+                or data.get("asr_api_rpm")
+                or DEFAULT_ASR_API_RPM
+            )
+        ),
         language=str(os.environ.get("SCRIPTORIUM_LANGUAGE") or data.get("language") or "en"),
         device=str(os.environ.get("SCRIPTORIUM_DEVICE") or data.get("device") or "auto"),
         batch_size=int(str(os.environ.get("SCRIPTORIUM_ASR_BATCH") or data.get("batch_size") or 8)),

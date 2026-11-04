@@ -232,6 +232,14 @@ SECTIONS: tuple[SettingSection, ...] = (
                 exclusive_min=True,
             ),
             SettingField(
+                "asr_api_rpm",
+                "ASR requests/min",
+                KIND_INT,
+                "Transcription API rate limit: a burst up to this many requests goes "
+                "out at once, the rest wait. 0 sends every request as soon as it is ready",
+                minimum=0,
+            ),
+            SettingField(
                 "language",
                 "Language",
                 KIND_TEXT,

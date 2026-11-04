@@ -177,6 +177,13 @@ class ConfigSettingsTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             self.config(asr_api_timeout=0)
 
+    def test_asr_api_rpm_defaults_to_no_throttling(self):
+        self.assertEqual(self.config().asr_api_rpm, 0)
+
+    def test_a_negative_asr_api_rpm_is_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            self.config(asr_api_rpm=-1)
+
     def test_ocr_languages_are_normalized_for_tesseract(self):
         config = self.config(ocr_languages="eng, ita, eng")
         self.assertEqual(config.ocr_languages, "eng+ita")
@@ -268,6 +275,16 @@ class LoadConfigTests(unittest.TestCase):
             write_config_values({"disabled_warnings": list(known_codes()[:2])})
             config = load_config()
         self.assertEqual(config.disabled_warnings, known_codes()[:2])
+
+    def test_asr_api_rpm_comes_from_the_environment(self):
+        env = dict(self.env)
+        env["SCRIPTORIUM_ASR_API_RPM"] = "180"
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().asr_api_rpm, 180)
+
+    def test_asr_api_rpm_defaults_to_zero_when_unset(self):
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(load_config().asr_api_rpm, 0)
 
 
 class WarningCollectorTests(unittest.TestCase):
