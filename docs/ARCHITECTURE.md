@@ -79,6 +79,23 @@ upload limit are split with ffmpeg and the chunk timestamps are shifted back ont
 original timeline. Provider credentials come from `GROQ_API_KEY`, `HF_TOKEN` or
 `OPENAI_API_KEY`, with `SCRIPTORIUM_ASR_API_KEY` as the override.
 
+**Concurrent transcription.** Both backends implement `transcribe_many`, which is what
+the `transcribe` stage calls; a single file goes through the same path with one entry.
+`LocalTranscriber` runs the sources in order, because its own batch already fills the
+device it runs on. `ApiTranscriber` plans first: every audio above the upload limit is
+split and probed, so each upload already knows the offset it will contribute. All
+uploads of all sources then enter one queue served by a bounded thread pool, paced by a
+token bucket built from `asr_api_rpm` (a burst up to that many requests leaves at once,
+the rest wait for tokens). Because the timestamps are shifted only after every answer
+is in, a slow source never blocks the next one and the reassembly is independent of the
+order the responses arrive in: the chunks of each source are regrouped by source id and
+chunk index. Workers return data and never touch the job; the stage writes each
+`transcript.json`, each per-source `sources/sNN.txt` and the combined
+`02.transcript.txt` itself, in source order. A source whose uploads all succeed keeps
+its transcript even when a sibling fails: the stage then fails naming the lost sources
+and the per-source artifacts let `resume` retry only those. `extract` still waits for
+the whole stage, so no text model call can see a partial transcript set.
+
 **MOC selection.** The MOC is resolved before transcription, so video content only
 contributes its file name; document text is already available. `Vault.find_mocs` walks every
 entry of `Config.search_paths` recursively and ignores roots outside `notes_root`,

@@ -354,6 +354,9 @@ class TuiApp:
     source_paths: list[Path] = field(default_factory=list)
     source_index: int = 0
     source_scroll: int = 0
+    # Per-source transcription state, keyed by the path the job was started
+    # with: the pipeline reports it while the sources are transcribed.
+    source_status: dict[str, str] = field(default_factory=dict)
     moc_hint: Path | None = None
     focus: str = PANE_INPUT
     active: str | None = None
@@ -812,6 +815,14 @@ class TuiApp:
                 self._reload_asides()
             elif stage == Stage.REPORT.value:
                 self._reload_artifacts()
+        elif kind == "source_progress":
+            path = str(event.get("path") or "")
+            if path:
+                self.source_status[path] = str(event.get("state") or "")
+            done = event.get("sources_done")
+            total = event.get("sources_total")
+            if done is not None and total:
+                self.status = f"{self._stage_text()} · {done}/{total} sources transcribed"
         elif kind == "stage_failed":
             stage = str(event.get("stage") or "")
             self.stage_status[stage] = "failed"
@@ -1300,6 +1311,7 @@ class TuiApp:
         self.current_group = ""
         self.group_position = ""
         self.stage_status = {}
+        self.source_status = {}
         self.diff_entries = []
         self.card_groups = []
         self.asides = []

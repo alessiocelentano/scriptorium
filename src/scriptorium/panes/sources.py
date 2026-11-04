@@ -13,6 +13,16 @@ from typing import Any
 from ..pane_api import Pane, PaneHost
 from ..tui_render import STYLE_DIM, STYLE_HEADING, STYLE_SELECTED
 
+#: Suffix drawn after a source while the pipeline transcribes it.
+_STATUS_MARKS = {"running": "·", "done": "✓", "failed": "✗"}
+
+
+def _status_mark(host: PaneHost, path: Path) -> str:
+    """The transcription mark for one source, or nothing outside a run."""
+    state = host.source_status.get(str(path.expanduser()))
+    mark = _STATUS_MARKS.get(state or "")
+    return f"  {mark}" if mark else ""
+
 
 class SourcesPane(Pane):
     """Collected sources, grouped by parent directory."""
@@ -47,7 +57,12 @@ class SourcesPane(Pane):
                 if is_selected:
                     selected_row = len(rows)
                 marker = "▸ " if is_selected else "  "
-                rows.append((marker + path.name, STYLE_SELECTED if is_selected else "normal"))
+                rows.append(
+                    (
+                        marker + path.name + _status_mark(host, path),
+                        STYLE_SELECTED if is_selected else "normal",
+                    )
+                )
         if host.moc_hint is not None:
             rows.append(("MOC hint: " + host.moc_hint.name, STYLE_HEADING))
         if not paths:

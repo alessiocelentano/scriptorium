@@ -102,6 +102,8 @@ class PaneHost(Protocol):
     source_paths: list[Any]
     source_index: int
     source_scroll: int
+    # Per-source transcription state keyed by the path the job started with.
+    source_status: dict[str, str]
     moc_hint: Any
     diff_entries: list[Any]
     diff_index: int

@@ -1,20 +1,25 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scriptorium.asr import (
+    MAX_IN_FLIGHT,
     USER_AGENT,
     ApiTranscriber,
     AsrSettings,
     LocalTranscriber,
     _multipart_body,
+    _RateLimiter,
     _segments_from_payload,
 )
 from scriptorium.audio import MediaInfo
 from scriptorium.errors import TranscribeError
 from scriptorium.log import Logger
+from scriptorium.models import Segment, Transcript
 
 
 class FakeResponse:
@@ -169,6 +174,244 @@ class ApiTranscriberTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("-f", command)
         self.assertIn("segment", command)
+
+
+class FakeClock:
+    """A clock whose ``sleep`` advances time instead of waiting."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept = 0.0
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self.slept += seconds
+
+
+class RateLimiterTests(unittest.TestCase):
+    def limiter(self, rpm: int) -> tuple[_RateLimiter, FakeClock]:
+        clock = FakeClock()
+        return _RateLimiter(rpm, clock=clock.clock, sleep=clock.sleep), clock
+
+    def test_a_burst_up_to_the_allowance_leaves_at_once(self):
+        limiter, clock = self.limiter(200)
+        for _ in range(200):
+            limiter.acquire()
+        self.assertEqual(clock.slept, 0.0)
+
+    def test_requests_over_the_allowance_wait_one_token_at_a_time(self):
+        limiter, clock = self.limiter(60)  # one token per second
+        for _ in range(62):
+            limiter.acquire()
+        self.assertAlmostEqual(clock.slept, 2.0, places=6)
+
+    def test_zero_rpm_never_waits(self):
+        limiter, clock = self.limiter(0)
+        for _ in range(100):
+            limiter.acquire()
+        self.assertEqual(clock.slept, 0.0)
+
+    def test_estimate_reports_only_the_waiting_part(self):
+        limiter, _clock = self.limiter(60)
+        self.assertEqual(limiter.estimate(30), 0.0)
+        self.assertAlmostEqual(limiter.estimate(63), 3.0, places=6)
+
+
+class ApiBatchTests(unittest.TestCase):
+    """One queue for every source and every chunk of a split recording."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.logger = Logger()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def source(self, name: str) -> Path:
+        path = self.root / name
+        path.write_bytes(b"fake mp3 bytes")
+        return path
+
+    def settings(self, **overrides: object) -> AsrSettings:
+        values: dict[str, object] = {
+            "backend": "api",
+            "api_model": "whisper-1",
+            "api_base_url": "https://api.openai.com/v1",
+            "api_key": "test-key",
+            "language": "en",
+        }
+        values.update(overrides)
+        return AsrSettings(**values)  # type: ignore[arg-type]
+
+    @staticmethod
+    def three_chunks(_transcriber, audio: Path, _directory: Path) -> list[Path]:
+        """Pretend every source is large enough to be split in three."""
+        return [audio.with_name(f"{audio.stem}-{index}.mp3") for index in range(1, 4)]
+
+    @staticmethod
+    def answer(audio: Path) -> dict:
+        """A payload naming the chunk it answers and lasting ten seconds."""
+        stem = audio.stem
+        return {
+            "language": "en",
+            "segments": [{"start": 0.0, "end": 4.0, "text": stem.replace("-", " ")}],
+        }
+
+    def batch(self, audios, request, **overrides):
+        with (
+            mock.patch.object(ApiTranscriber, "_chunks", ApiBatchTests.three_chunks),
+            mock.patch("scriptorium.asr._media_duration", return_value=10.0),
+            mock.patch.object(ApiTranscriber, "_request", side_effect=request),
+        ):
+            return ApiTranscriber(self.settings(**overrides), self.logger).transcribe_many(audios)
+
+    def test_chunks_arriving_out_of_order_are_reassembled_per_source(self):
+        first, second = self.source("a.mp3"), self.source("b.mp3")
+
+        def request(audio: Path, _prompt: str | None = None) -> dict:
+            # The last chunk of each source answers first, so the completion
+            # order never matches the source order.
+            index = int(audio.stem.rsplit("-", 1)[1])
+            time.sleep(0.01 * (4 - index))
+            return self.answer(audio)
+
+        batch = self.batch([("s01", first), ("s02", second)], request)
+
+        self.assertTrue(batch.ok())
+        self.assertEqual(list(batch.transcripts), ["s01", "s02"])
+        a = batch.transcripts["s01"]
+        self.assertEqual(a.text, "a 1\na 2\na 3")
+        self.assertEqual([segment.start for segment in a.segments], [0.0, 10.0, 20.0])
+        self.assertEqual([segment.end for segment in a.segments], [4.0, 14.0, 24.0])
+        self.assertEqual(a.duration, 30.0)
+        self.assertEqual(batch.transcripts["s02"].text, "b 1\nb 2\nb 3")
+
+    def test_one_failed_chunk_loses_only_its_source(self):
+        first, second = self.source("a.mp3"), self.source("b.mp3")
+
+        def request(audio: Path, _prompt: str | None = None) -> dict:
+            if audio.stem == "b-2":
+                raise TranscribeError("HTTP 500: upstream is down")
+            return self.answer(audio)
+
+        batch = self.batch([("s01", first), ("s02", second)], request)
+
+        self.assertFalse(batch.ok())
+        self.assertEqual(list(batch.failures), ["s02"])
+        self.assertIn("HTTP 500", batch.failures["s02"])
+        self.assertEqual(list(batch.transcripts), ["s01"])
+
+    def test_the_pool_never_opens_more_uploads_than_the_cap(self):
+        audio = self.source("long.mp3")
+        lock = threading.Lock()
+        live = 0
+        peak = 0
+
+        def request(_audio: Path, _prompt: str | None = None) -> dict:
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            time.sleep(0.005)
+            with lock:
+                live -= 1
+            return {"text": "words", "duration": 1.0}
+
+        def many_chunks(_transcriber, _audio: Path, _directory: Path) -> list[Path]:
+            return [audio.with_name(f"long-{index}.mp3") for index in range(1, 41)]
+
+        with (
+            mock.patch.object(ApiTranscriber, "_chunks", many_chunks),
+            mock.patch("scriptorium.asr._media_duration", return_value=1.0),
+            mock.patch.object(ApiTranscriber, "_request", side_effect=request),
+        ):
+            batch = ApiTranscriber(self.settings(), self.logger).transcribe_many([("s01", audio)])
+
+        self.assertTrue(batch.ok())
+        self.assertLessEqual(peak, MAX_IN_FLIGHT)
+        self.assertGreater(peak, 1, "the uploads must actually overlap")
+
+    def test_progress_reports_every_source_once(self):
+        first, second = self.source("a.mp3"), self.source("b.mp3")
+        events: list[tuple[str, str, int, int]] = []
+
+        def on_progress(source_id: str, *, state: str, done: int, total: int) -> None:
+            events.append((source_id, state, done, total))
+
+        with (
+            mock.patch.object(ApiTranscriber, "_chunks", ApiBatchTests.three_chunks),
+            mock.patch("scriptorium.asr._media_duration", return_value=10.0),
+            mock.patch.object(
+                ApiTranscriber, "_request", side_effect=lambda audio, _prompt: self.answer(audio)
+            ),
+        ):
+            ApiTranscriber(self.settings(), self.logger).transcribe_many(
+                [("s01", first), ("s02", second)], on_progress=on_progress
+            )
+
+        final = [event for event in events if event[1] in {"done", "failed"}]
+        self.assertEqual(sorted(event[0] for event in final), ["s01", "s02"])
+        for _source_id, state, done, total in final:
+            self.assertEqual(state, "done")
+            self.assertEqual((done, total), (3, 3))
+
+    def test_an_audio_that_cannot_be_split_loses_only_itself(self):
+        first, second = self.source("a.mp3"), self.source("b.mp3")
+
+        def chunks(_transcriber, audio: Path, directory: Path) -> list[Path]:
+            if audio.stem == "a":
+                raise TranscribeError("cannot split a.mp3 for the API: no ffmpeg")
+            return ApiBatchTests.three_chunks(None, audio, directory)
+
+        with (
+            mock.patch.object(ApiTranscriber, "_chunks", chunks),
+            mock.patch("scriptorium.asr._media_duration", return_value=10.0),
+            mock.patch.object(
+                ApiTranscriber, "_request", side_effect=lambda audio, _prompt: self.answer(audio)
+            ),
+        ):
+            batch = ApiTranscriber(self.settings(), self.logger).transcribe_many(
+                [("s01", first), ("s02", second)]
+            )
+
+        self.assertEqual(list(batch.failures), ["s01"])
+        self.assertEqual(list(batch.transcripts), ["s02"])
+
+
+class LocalBatchTests(unittest.TestCase):
+    def test_local_batches_stay_sequential(self):
+        live = 0
+        peak = 0
+        order: list[str] = []
+        lock = threading.Lock()
+
+        def transcribe(_self, audio: Path, prompt: str | None = None) -> Transcript:
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+                order.append(audio.name)
+            with lock:
+                live -= 1
+            return Transcript(
+                language="en",
+                duration=1.0,
+                segments=[Segment(start=0.0, end=1.0, text=audio.name)],
+            )
+
+        with mock.patch.object(LocalTranscriber, "transcribe", transcribe):
+            batch = LocalTranscriber(AsrSettings(), Logger()).transcribe_many(
+                [("s01", Path("a.mp3")), ("s02", Path("b.mp3"))]
+            )
+
+        self.assertTrue(batch.ok())
+        self.assertEqual(peak, 1, "the local model must not run two sources at once")
+        self.assertEqual(order, ["a.mp3", "b.mp3"])
+        self.assertEqual(list(batch.transcripts), ["s01", "s02"])
 
 
 class LocalTranscriberTests(unittest.TestCase):

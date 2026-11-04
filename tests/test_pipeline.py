@@ -8,7 +8,7 @@ from unittest import mock
 from scriptorium.asr import ApiTranscriber, LocalTranscriber
 from scriptorium.audio import MediaInfo
 from scriptorium.config import Config
-from scriptorium.errors import ConfigurationError, LLMError
+from scriptorium.errors import ConfigurationError, LLMError, StageError, TranscribeError
 from scriptorium.log import Logger
 from scriptorium.models import Plan, Segment, Transcript
 from scriptorium.pdf_images import ExtractedImage, ImageHarvest
@@ -242,6 +242,85 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("## Topic groups", report)
         self.assertIn("Search Notes", report)
 
+    def test_extract_waits_for_every_transcript(self):
+        second = self.root / "second.mp4"
+        second.write_bytes(b"fake video")
+        self.group_payload = {
+            "groups": [{"id": "g1", "topic": "Everything", "source_ids": ["s01", "s02"]}],
+            "todos": [],
+        }
+        transcripts_at_extract: list[set[str]] = []
+        original = self.fake_chat
+
+        def spy(_client, system, user, *, phase="llm", temperature=0.2, max_tokens=8192):
+            if phase == "extract":
+                # The barrier: no text model call may see a partial set.
+                job = next((self.home / "jobs").iterdir())
+                transcripts_at_extract.append(
+                    {path.parent.name for path in job.glob("sources/*/transcript.json")}
+                )
+            return original(
+                system, user, phase=phase, temperature=temperature, max_tokens=max_tokens
+            )
+
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", self.fake_transcribe),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", spy),
+        ):
+            state = Pipeline(self.config, self.ui, self.logger).run(
+                [self.video, second], RunOptions(course="Test Course", accept_merges=True)
+            )
+
+        self.assertTrue(state.completed())
+        # One extract call per chunk: every one of them must already see both.
+        self.assertTrue(transcripts_at_extract)
+        for seen in transcripts_at_extract:
+            self.assertEqual(seen, {"s01", "s02"})
+
+    def test_a_failed_source_keeps_the_others_and_resume_finishes_it(self):
+        second = self.root / "second.mp4"
+        second.write_bytes(b"fake video")
+        self.group_payload = {
+            "groups": [{"id": "g1", "topic": "Everything", "source_ids": ["s01", "s02"]}],
+            "todos": [],
+        }
+
+        def one_source_down(_transcriber, audio, prompt=None):
+            if audio.parent.name == "s02":
+                raise TranscribeError("HTTP 500: upstream is down")
+            return self.fake_transcribe(audio, prompt=prompt)
+
+        pipeline = Pipeline(self.config, self.ui, self.logger)
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", one_source_down),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self.fake_chat),
+            self.assertRaises(StageError) as caught,
+        ):
+            pipeline.run([self.video, second], RunOptions(course="Test Course"))
+
+        self.assertIn("second.mp4", str(caught.exception))
+        job = next((self.home / "jobs").iterdir())
+        self.assertTrue((job / "sources" / "s01" / "transcript.json").is_file())
+        self.assertFalse((job / "sources" / "s02" / "transcript.json").exists())
+
+        asked: list[str] = []
+
+        def working(_transcriber, audio, prompt=None):
+            asked.append(audio.parent.name)
+            return self.fake_transcribe(audio, prompt=prompt)
+
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", working),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self.fake_chat),
+        ):
+            state = pipeline.resume(job.name, RunOptions(accept_merges=True))
+
+        self.assertEqual(asked, ["s02"], "the finished transcript must not be redone")
+        self.assertTrue(state.completed())
+
     def test_grouping_failure_falls_back_to_one_group(self):
         notes = self.root / "notes.md"
         notes.write_text("Notes about heuristic search.", encoding="utf-8")
@@ -385,20 +464,19 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(resumed.options.get("dry_run"))
         self.assertTrue((self.vault_dir / "Test Note.md").is_file())
 
-
     def failing_chat(self, system, user, *, phase="llm", **kwargs):
         if phase == "outline":
             raise LLMError("model offline")
         return self.fake_chat(system, user, phase=phase, **kwargs)
 
     def test_a_failed_run_is_recorded_and_resumable(self):
+        pipeline = Pipeline(self.config, self.ui, self.logger)
         with (
             mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
             mock.patch("scriptorium.asr.LocalTranscriber.transcribe", self.fake_transcribe),
             mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self.failing_chat),
             self.assertRaises(LLMError),
         ):
-            pipeline = Pipeline(self.config, self.ui, self.logger)
             pipeline.run([self.video], RunOptions(course="Test Course"))
 
         state = pipeline.store.recent()[0]

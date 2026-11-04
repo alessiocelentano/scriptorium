@@ -693,8 +693,8 @@ min_width = 20
         _tab_to(app, "asr")
         state = app.settings
         assert state is not None
-        # device is the eighth field: after the ASR block and language.
-        for _ in range(7):
+        # device is the ninth field: after the ASR block, the rate limit and language.
+        for _ in range(8):
             app._handle_settings_key("j")
         app._handle_settings_key("e")
         self.assertIsNone(state.editor)
@@ -2743,7 +2743,7 @@ class ResumeTests(unittest.TestCase):
             created_at="2026-01-01T10:00:00+00:00",
             finished_at="2026-01-01T10:01:00+00:00",
             status="failed",
-            error=state.error,
+            error=state.error or "",
             sources=[str(self.source)],
         )
         HistoryStore(self.config.history_dir).save(entry)
@@ -2791,7 +2791,7 @@ class ResumeTests(unittest.TestCase):
                 created_at="2026-01-01T10:00:00+00:00",
                 finished_at="2026-01-01T10:01:00+00:00",
                 status="failed",
-                error=state.error,
+                error=state.error or "",
                 sources=[str(self.source)],
             )
         )
