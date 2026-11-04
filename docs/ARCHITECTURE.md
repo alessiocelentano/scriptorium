@@ -28,12 +28,16 @@ The TUI runs `Pipeline` in a worker thread and consumes `on_event` messages; the
 same `ConsoleUI` interface is adapted to modal prompts, so merge review keeps the
 same guarantees as the CLI.
 
-When a non-dry run completes, `history.py` reads the job's `apply.json`,
+When a job starts and again at every terminal outcome (completed, failed, or a
+dry run waiting to be applied), `history.py` reads the job's `apply.json`,
 `05.plan.json` and `cards.json` into one snapshot under
 `$SCRIPTORIUM_ARTIFACTS_DIR/history/<job-id>.json`: the generated text mapped to the box
 that displayed it (changes and diffs, flashcards, Extras) plus the collected
-sources. The snapshot is presentation data, not a resume artifact; the TUI
-`/history` window restores it into the panes without replaying the pipeline.
+sources and the run status. The snapshot is presentation data, not a resume
+artifact: the TUI `/history` window lists every run and loads the selected one
+back into the panes without replaying the pipeline. `/resume` (TUI) and
+`scriptorium resume` (CLI) continue the loaded or most recent unfinished job
+from its job directory, skipping the stages already marked done.
 
 ## Data contracts
 

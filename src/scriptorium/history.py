@@ -1,12 +1,14 @@
-"""Completed-run history: the generated text mapped to the box that showed it.
+"""Run history: the generated text mapped to the box that showed it.
 
-A run is saved when the pipeline completes.  The snapshot holds only what the
+A snapshot is written while a run is in progress and again for every terminal
+outcome (completed, failed, or a dry run waiting to be applied), so
+``/history`` lists every run and its state.  The snapshot holds only what the
 TUI displays -- the collected sources, the vault changes and their diffs, the
-draft flashcards and the Extras -- so ``/history`` can restore a previous run
-without replaying the pipeline or depending on the job directory.
+draft flashcards and the Extras -- so a previous run can be loaded without
+replaying the pipeline or depending on the job directory.
 
 The file is deterministic JSON under ``$SCRIPTORIUM_ARTIFACTS_DIR/history``; one file per
-job id, rewritten when the same job is resumed and completed again.
+job id, rewritten when the same job is resumed.
 """
 
 from __future__ import annotations
@@ -20,18 +22,49 @@ from pathlib import Path
 from typing import Any
 
 from .models import Aside, Flashcard
+from .state import JobState
 from .tui_data import CardGroup, DiffEntry, load_asides, load_card_groups, load_diff_entries
+
+RUNNING = "running"
+COMPLETED = "completed"
+FAILED = "failed"
+DRY_RUN = "dry_run"
+
+
+def status_text(status: str, error: str = "") -> str:
+    """One human label for a run status, used by the history list and the CLI."""
+    if status == COMPLETED:
+        return "completed"
+    if status == RUNNING:
+        return "in progress"
+    if status == DRY_RUN:
+        return "dry run · ready to apply"
+    if status == FAILED:
+        stage = (error or "").split(":", 1)[0].strip() if ":" in (error or "") else ""
+        return f"failed at {stage}" if stage else "failed"
+    return "incomplete"
+
+
+def state_status(state: JobState) -> tuple[str, str]:
+    """The history status and error for a job state, read from its stages."""
+    if state.completed():
+        return (DRY_RUN, "") if state.options.get("dry_run") else (COMPLETED, "")
+    if state.error:
+        return FAILED, state.error
+    return "incomplete", ""
 
 
 @dataclass
 class HistoryEntry:
-    """One completed run, already shaped for the TUI panes."""
+    """One run, already shaped for the TUI panes."""
 
     id: str
     job_id: str
     course: str
     created_at: str
     finished_at: str
+    status: str = COMPLETED
+    error: str = ""
     sources: list[str] = field(default_factory=list)
     changes: list[DiffEntry] = field(default_factory=list)
     card_groups: list[CardGroup] = field(default_factory=list)
@@ -40,6 +73,14 @@ class HistoryEntry:
     @property
     def card_count(self) -> int:
         return sum(len(group.cards) for group in self.card_groups)
+
+    @property
+    def status_label(self) -> str:
+        return status_text(self.status, self.error)
+
+    @property
+    def resumable(self) -> bool:
+        return self.status != COMPLETED
 
     @property
     def summary(self) -> str:
@@ -56,7 +97,7 @@ class HistoryEntry:
     def label(self) -> str:
         stamp = self.finished_at or self.created_at
         course = self.course or self.job_id
-        return f"{stamp} · {course}"
+        return f"{stamp} · {course} · {self.status_label}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +106,8 @@ class HistoryEntry:
             "course": self.course,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
+            "status": self.status,
+            "error": self.error,
             "sources": list(self.sources),
             "changes": [_diff_to_dict(entry) for entry in self.changes],
             "flashcards": [_group_to_dict(group) for group in self.card_groups],
@@ -80,6 +123,8 @@ class HistoryEntry:
             course=str(payload.get("course") or ""),
             created_at=str(payload.get("created_at") or ""),
             finished_at=str(payload.get("finished_at") or payload.get("created_at") or ""),
+            status=str(payload.get("status") or COMPLETED),
+            error=str(payload.get("error") or ""),
             sources=[str(path) for path in payload.get("sources") or []],
             changes=[_diff_from_dict(item) for item in payload.get("changes") or []],
             card_groups=[_group_from_dict(item) for item in payload.get("flashcards") or []],
@@ -88,7 +133,7 @@ class HistoryEntry:
 
 
 class HistoryStore:
-    """Reads and writes completed-run snapshots in one directory."""
+    """Reads and writes run snapshots in one directory."""
 
     def __init__(self, directory: Path | str):
         self.directory = Path(directory)
@@ -100,7 +145,7 @@ class HistoryStore:
         return path
 
     def entries(self, limit: int = 200) -> list[HistoryEntry]:
-        """Every readable snapshot, newest finished run first."""
+        """Every readable snapshot, newest run first."""
         if not self.directory.is_dir():
             return []
         found: list[HistoryEntry] = []
@@ -119,7 +164,7 @@ class HistoryStore:
         return found[:limit]
 
 
-def record_completed_run(
+def record_run(
     history_dir: Path | str,
     job_dir: Path | str,
     *,
@@ -128,8 +173,10 @@ def record_completed_run(
     sources: Sequence[str],
     created_at: str,
     finished_at: str,
+    status: str = COMPLETED,
+    error: str = "",
 ) -> HistoryEntry:
-    """Read a completed job's artifacts into a snapshot and save it."""
+    """Read a job's artifacts into a snapshot and save it."""
     directory = Path(job_dir)
     plan_path = directory / "05.plan.json"
     entry = HistoryEntry(
@@ -138,6 +185,8 @@ def record_completed_run(
         course=course,
         created_at=created_at,
         finished_at=finished_at,
+        status=status,
+        error=error,
         sources=[str(source) for source in sources],
         changes=load_diff_entries(directory / "apply.json"),
         card_groups=load_card_groups(plan_path, directory / "cards.json"),

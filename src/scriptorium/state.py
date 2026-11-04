@@ -212,13 +212,39 @@ class JobStore:
         return JobState.model_validate_json(path.read_text(encoding="utf-8"))
 
     def recent(self, limit: int = 20) -> list[JobState]:
+        return self._states()[:limit]
+
+    def resumable(self, limit: int = 20) -> list[JobState]:
+        """Jobs with work left, newest update first."""
+        found = [
+            state
+            for state in self._states()
+            if not (state.completed() and not state.options.get("dry_run"))
+        ]
+        return found[:limit]
+
+    def _states(self) -> list[JobState]:
         states: list[JobState] = []
-        for path in sorted(self.jobs_dir.glob("*/state.json"), reverse=True)[:limit]:
+        for path in self.jobs_dir.glob("*/state.json"):
             try:
                 states.append(JobState.model_validate_json(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue
+        states.sort(key=lambda state: state.updated_at, reverse=True)
         return states
+
+    def resolve(self, job_id: str) -> JobState:
+        """Load a job by exact id, or by an unambiguous prefix."""
+        directory = self.job_dir(job_id)
+        if (directory / "state.json").is_file():
+            return self.load(job_id)
+        matches = [state for state in self.recent(200) if state.job_id.startswith(job_id)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            names = ", ".join(state.job_id for state in matches)
+            raise StageError(f"ambiguous job id {job_id!r}: {names}")
+        raise StageError(f"job not found: {job_id}")
 
     # -- single-run lock ----------------------------------------------------- #
 

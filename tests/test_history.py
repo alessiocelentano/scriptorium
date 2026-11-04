@@ -1,4 +1,4 @@
-"""Completed-run history: the snapshot round-trips the text each box showed."""
+"""Run history: the snapshot round-trips the text each box showed and its status."""
 
 from __future__ import annotations
 
@@ -7,8 +7,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scriptorium.history import HistoryEntry, HistoryStore, record_completed_run
+from scriptorium.history import (
+    HistoryEntry,
+    HistoryStore,
+    record_run,
+    state_status,
+    status_text,
+)
 from scriptorium.models import Aside, Flashcard, Plan, PlannedNote
+from scriptorium.state import GLOBAL_STAGES, GROUP_STAGES, GroupState, JobState
 
 
 class HistoryStoreTests(unittest.TestCase):
@@ -69,9 +76,9 @@ class HistoryStoreTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_record_completed_run_round_trips_every_box(self):
+    def test_record_run_round_trips_every_box(self):
         self.write_artifacts()
-        record_completed_run(
+        record_run(
             self.home / "history",
             self.job_dir,
             job_id="job-1",
@@ -112,7 +119,7 @@ class HistoryStoreTests(unittest.TestCase):
         store = HistoryStore(self.home / "history")
         store.directory.mkdir(parents=True)
         (store.directory / "broken.json").write_text("{", encoding="utf-8")
-        record_completed_run(
+        record_run(
             self.home / "history",
             self.job_dir,
             job_id="job-2",
@@ -123,6 +130,47 @@ class HistoryStoreTests(unittest.TestCase):
         )
         entries = HistoryStore(self.home / "history").entries()
         self.assertEqual([entry.job_id for entry in entries], ["job-2"])
+
+    def test_a_failed_run_carries_its_stage_and_stays_resumable(self):
+        entry = HistoryEntry(
+            id="job-1",
+            job_id="job-1",
+            course="Course",
+            created_at="2026-01-01T10:00:00+00:00",
+            finished_at="2026-01-01T10:01:00+00:00",
+            status="failed",
+            error="compose: the model returned invalid JSON",
+        )
+        payload = json.loads(json.dumps(entry.to_dict()))
+        loaded = HistoryEntry.from_dict(payload)
+        self.assertEqual(loaded.status, "failed")
+        self.assertEqual(loaded.status_label, "failed at compose")
+        self.assertTrue(loaded.resumable)
+        self.assertIn("failed at compose", loaded.label)
+
+    def test_a_running_run_is_not_completed_but_stays_resumable(self):
+        entry = HistoryEntry(
+            id="job-1",
+            job_id="job-1",
+            course="Course",
+            created_at="2026-01-01T10:00:00+00:00",
+            finished_at="2026-01-01T10:00:00+00:00",
+            status="running",
+        )
+        self.assertEqual(entry.status_label, "in progress")
+        self.assertTrue(entry.resumable)
+
+    def test_old_snapshots_without_a_status_count_as_completed(self):
+        payload = {
+            "id": "job-1",
+            "job_id": "job-1",
+            "course": "Course",
+            "created_at": "2026-01-01T10:00:00+00:00",
+            "finished_at": "2026-01-01T10:05:00+00:00",
+        }
+        entry = HistoryEntry.from_dict(payload)
+        self.assertEqual(entry.status, "completed")
+        self.assertFalse(entry.resumable)
 
     def test_newest_finished_run_comes_first(self):
         store = HistoryStore(self.home / "history")
@@ -141,6 +189,39 @@ class HistoryStoreTests(unittest.TestCase):
                 )
             )
         self.assertEqual([entry.job_id for entry in store.entries()], ["newer", "older"])
+
+
+class RunStatusTests(unittest.TestCase):
+    def test_status_text_names_each_state(self):
+        self.assertEqual(status_text("completed"), "completed")
+        self.assertEqual(status_text("running"), "in progress")
+        self.assertEqual(status_text("dry_run"), "dry run · ready to apply")
+        self.assertEqual(status_text("failed", "outline: boom"), "failed at outline")
+        self.assertEqual(status_text("failed"), "failed")
+        self.assertEqual(status_text("incomplete"), "incomplete")
+
+    def test_state_status_reads_the_job_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = JobState(
+                job_id="job-1",
+                video=str(Path(directory) / "lecture.mp4"),
+                course="Course",
+            )
+            self.assertEqual(state_status(state), ("incomplete", ""))
+
+            state.error = "compose: boom"
+            self.assertEqual(state_status(state), ("failed", "compose: boom"))
+
+            for stage in GLOBAL_STAGES:
+                state.set_status(stage, "done")
+            group = GroupState(id="g1", topic="Topic")
+            for stage in GROUP_STAGES:
+                group.set_status(stage, "done")
+            state.groups = [group]
+            self.assertEqual(state_status(state), ("completed", ""))
+
+            state.options["dry_run"] = True
+            self.assertEqual(state_status(state), ("dry_run", ""))
 
 
 if __name__ == "__main__":
