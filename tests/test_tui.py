@@ -1,4 +1,5 @@
 import curses
+import json
 import os
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from scriptorium.errors import ConfigurationError
 from scriptorium.history import HistoryEntry, HistoryStore
 from scriptorium.models import Aside, Flashcard, Plan, PlannedNote
 from scriptorium.settings import SECTIONS
+from scriptorium.state import GLOBAL_STAGES, GROUP_STAGES, GroupState, JobStore, Stage
 from scriptorium.targeting import NoteTarget
 from scriptorium.tui import (
     STYLE_ACTIVE_BORDER,
@@ -2529,7 +2531,7 @@ class HistoryAndCommandsTests(unittest.TestCase):
         self.assertTrue(popup.is_command)
         self.assertEqual(
             {match.path for match in popup.matches},
-            {"/run", "/new", "/history", "/wizard"},
+            {"/run", "/new", "/history", "/resume", "/wizard"},
         )
 
         app._handle_input_key("h")
@@ -2543,7 +2545,7 @@ class HistoryAndCommandsTests(unittest.TestCase):
             for y in range(app.scr.rows)
         )
         self.assertIn("Commands", text)
-        self.assertIn("browse completed runs", text)
+        self.assertIn("browse every run", text)
 
     def test_enter_on_a_command_suggestion_runs_it(self):
         app = TuiApp(config=self.config)
@@ -2643,6 +2645,163 @@ class HistoryAndCommandsTests(unittest.TestCase):
         app.open_history()
         self.assertIsNone(app.modal)
         self.assertIn("already running", app.status)
+
+
+class ResumeTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+        self.source = self.root / "lecture.mp4"
+        self.source.write_bytes(b"x")
+        self.config = Config(
+            notes_root=self.vault,
+            artifacts_dir=self.root / "home",
+            search_paths=(self.root,),
+        )
+        self.store = JobStore(self.config.artifacts_dir)
+        self._key = mock.patch.dict(os.environ, {"SCRIPTORIUM_LLM_API_KEY": "test-key"})
+        self._key.start()
+
+    def tearDown(self):
+        self._key.stop()
+        self._tmp.cleanup()
+
+    def _job(self, *, finished=False, error=None):
+        state = self.store.create([self.source], "Test Course")
+        state.set_status(Stage.SOURCES, "done")
+        state.error = error
+        if finished:
+            for stage in GLOBAL_STAGES:
+                state.set_status(stage, "done")
+            group = GroupState(id="g1", topic="Topic")
+            for stage in GROUP_STAGES:
+                group.set_status(stage, "done")
+            state.groups = [group]
+        self.store.save(state)
+        return state
+
+    def _app_with_loaded_job(self, state):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.current_job_id = state.job_id
+        return app
+
+    def test_resume_without_a_loaded_job_points_to_history(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.start_resume()
+        self.assertEqual(app.status, "no job loaded, pick one with /history")
+        self.assertFalse(app.running)
+
+    def test_resume_starts_the_loaded_job_without_asking_for_an_id(self):
+        state = self._job(error="outline: boom")
+        app = self._app_with_loaded_job(state)
+        started = []
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                started.append(self.args[0])
+
+        with mock.patch("scriptorium.tui.threading.Thread", FakeThread):
+            app.start_resume()
+
+        self.assertTrue(app.running)
+        self.assertEqual(len(started), 1)
+        request = started[0]
+        self.assertEqual(request.job_id, state.job_id)
+        self.assertEqual(request.sources, [self.source])
+        self.assertEqual(app.current_job_id, state.job_id)
+        self.assertIn("resuming", app.status)
+
+    def test_resume_refuses_a_completed_job(self):
+        state = self._job(finished=True)
+        app = self._app_with_loaded_job(state)
+        app.start_resume()
+        self.assertEqual(app.status, f"job {state.job_id} is already complete")
+        self.assertFalse(app.running)
+
+    def test_resume_refuses_a_missing_source(self):
+        state = self._job(error="outline: boom")
+        self.source.unlink()
+        app = self._app_with_loaded_job(state)
+        app.start_resume()
+        self.assertEqual(app.status, f"source not found: {self.source}")
+        self.assertFalse(app.running)
+
+    def test_history_lists_failed_runs_and_resume_continues_the_loaded_one(self):
+        state = self._job(error="compose: boom")
+        entry = HistoryEntry(
+            id=state.job_id,
+            job_id=state.job_id,
+            course="Test Course",
+            created_at="2026-01-01T10:00:00+00:00",
+            finished_at="2026-01-01T10:01:00+00:00",
+            status="failed",
+            error=state.error,
+            sources=[str(self.source)],
+        )
+        HistoryStore(self.config.history_dir).save(entry)
+
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.open_history()
+        app._draw()
+        text = "".join(
+            "".join(app.scr.cells.get((y, x), "") for x in range(app.scr.cols))
+            for y in range(app.scr.rows)
+        )
+        self.assertIn("failed at", text)
+
+        app._handle_modal_key("\n")
+        self.assertEqual(app.current_job_id, state.job_id)
+        self.assertIn("/resume to continue", app.status)
+
+    def test_loading_a_resumable_run_reads_the_latest_artifacts(self):
+        state = self._job(error="apply: boom")
+        job_dir = self.store.job_dir(state.job_id)
+        (job_dir / "apply.json").write_text(
+            json.dumps(
+                {
+                    "created": [
+                        {
+                            "path": "New.md",
+                            "action": "create",
+                            "added_lines": 1,
+                            "removed_lines": 0,
+                            "diff": "--- /dev/null\n+++ b/New.md\n@@ -0,0 +1 @@\n+one",
+                        }
+                    ],
+                    "merged": [],
+                    "moc": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        HistoryStore(self.config.history_dir).save(
+            HistoryEntry(
+                id=state.job_id,
+                job_id=state.job_id,
+                course="Test Course",
+                created_at="2026-01-01T10:00:00+00:00",
+                finished_at="2026-01-01T10:01:00+00:00",
+                status="failed",
+                error=state.error,
+                sources=[str(self.source)],
+            )
+        )
+
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.open_history()
+        app._handle_modal_key("\n")
+
+        self.assertEqual([entry.path for entry in app.diff_entries], ["New.md"])
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from .errors import (
     StageError,
 )
 from .flashcards import CardWriteResult, write_drafts
-from .history import record_completed_run
+from .history import record_run, state_status
 from .llm.client import DeepSeekClient
 from .log import Logger, Timer
 from .models import ExtractResult, Grouping, Outline, Plan, SourceGroup, TodoItem, Transcript
@@ -105,6 +105,9 @@ class Pipeline:
 
     def resume(self, job_id: str, options: RunOptions) -> JobState:
         state = self.store.load(job_id)
+        missing = [Path(source) for source in state.sources if not Path(source).is_file()]
+        if missing:
+            raise ConfigurationError(f"source not found: {missing[0]}")
         for key, value in asdict(options).items():
             if key == "course" or value is None:
                 continue
@@ -139,43 +142,17 @@ class Pipeline:
 
         with self.store.lock(state.job_id):
             try:
-                for stage in GLOBAL_STAGES:
-                    if state.status(stage) == "done":
-                        self.logger.debug(f"skipping completed stage: {stage.value}")
-                        continue
-                    self._run_one(state, stage)
-
-                self._ensure_groups(state)
-                for index, group in enumerate(state.groups, start=1):
-                    self._emit(
-                        "group_start",
-                        group_id=group.id,
-                        topic=group.topic,
-                        index=index,
-                        total=len(state.groups),
-                    )
-                    for stage in GROUP_STAGES:
-                        if group.status(stage) == "done":
-                            continue
-                        if self._flag(state, "dry_run") and stage is Stage.FLASHCARDS:
-                            group.set_status(stage, "skipped")
-                            self.store.save(state)
-                            continue
-                        self._run_one(state, stage, group)
-                        if self._flag(state, "dry_run") and stage is Stage.APPLY:
-                            # The simulated apply must not count as the real one.
-                            group.set_status(stage, "skipped")
-                            self.store.save(state)
-
-                for stage in (Stage.CLEANUP, Stage.REPORT):
-                    if state.status(stage) == "done":
-                        continue
-                    self._run_one(state, stage)
-
-                if self._flag(state, "dry_run"):
-                    self.logger.info(
-                        f"dry run complete; apply with: scriptorium resume {state.job_id} --yes"
-                    )
+                self._record_history(state, status="running")
+                self._execute_stages(state)
+                status, error = state_status(state)
+                self._record_history(state, status=status, error=error)
+            except BaseException:
+                self._record_history(
+                    state,
+                    status="failed",
+                    error=state.error or "interrupted",
+                )
+                raise
             finally:
                 if self.sandbox is not None:
                     self.sandbox.discard()
@@ -183,11 +160,48 @@ class Pipeline:
                     self.sandbox = None
                     self.vault = Vault(self.config.notes_root)
 
-        if state.completed() and not self._flag(state, "dry_run"):
-            self._record_history(state)
-
         self._emit("job_done", job_id=state.job_id)
         return state
+
+    def _execute_stages(self, state: JobState) -> None:
+        """Run every stage the state has not finished yet."""
+        for stage in GLOBAL_STAGES:
+            if state.status(stage) == "done":
+                self.logger.debug(f"skipping completed stage: {stage.value}")
+                continue
+            self._run_one(state, stage)
+
+        self._ensure_groups(state)
+        for index, group in enumerate(state.groups, start=1):
+            self._emit(
+                "group_start",
+                group_id=group.id,
+                topic=group.topic,
+                index=index,
+                total=len(state.groups),
+            )
+            for stage in GROUP_STAGES:
+                if group.status(stage) == "done":
+                    continue
+                if self._flag(state, "dry_run") and stage is Stage.FLASHCARDS:
+                    group.set_status(stage, "skipped")
+                    self.store.save(state)
+                    continue
+                self._run_one(state, stage, group)
+                if self._flag(state, "dry_run") and stage is Stage.APPLY:
+                    # The simulated apply must not count as the real one.
+                    group.set_status(stage, "skipped")
+                    self.store.save(state)
+
+        for stage in (Stage.CLEANUP, Stage.REPORT):
+            if state.status(stage) == "done":
+                continue
+            self._run_one(state, stage)
+
+        if self._flag(state, "dry_run"):
+            self.logger.info(
+                f"dry run complete; apply with: scriptorium resume {state.job_id} --yes"
+            )
 
     def _run_one(self, state: JobState, stage: Stage, group: GroupState | None = None) -> None:
         if group is not None:
@@ -1352,6 +1366,7 @@ class Pipeline:
         if failure:
             lines.append("## Next step")
             lines.append(f"- Resume after fixing the error: `scriptorium resume {state.job_id}`")
+            lines.append("- Or resume the latest unfinished job: `scriptorium resume`")
         elif self._flag(state, "dry_run"):
             lines.append("## Next step")
             lines.append(f"- Apply the plan: `scriptorium resume {state.job_id} --yes`")
@@ -1371,10 +1386,16 @@ class Pipeline:
             except Exception:
                 pass
 
-    def _record_history(self, state: JobState) -> None:
-        """Save the completed run's generated text for the TUI history."""
+    def _record_history(
+        self,
+        state: JobState,
+        *,
+        status: str = "completed",
+        error: str = "",
+    ) -> None:
+        """Save the run's generated text for the TUI history."""
         try:
-            record_completed_run(
+            record_run(
                 self.config.history_dir,
                 self.store.job_dir(state.job_id),
                 job_id=state.job_id,
@@ -1382,6 +1403,8 @@ class Pipeline:
                 sources=state.sources,
                 created_at=state.created_at,
                 finished_at=state.updated_at,
+                status=status,
+                error=error,
             )
         except (OSError, ValueError) as exc:
             # A history snapshot is a convenience, never a reason to fail a run.

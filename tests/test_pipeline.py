@@ -8,11 +8,13 @@ from unittest import mock
 from scriptorium.asr import ApiTranscriber, LocalTranscriber
 from scriptorium.audio import MediaInfo
 from scriptorium.config import Config
+from scriptorium.errors import ConfigurationError, LLMError
 from scriptorium.log import Logger
 from scriptorium.models import Plan, Segment, Transcript
 from scriptorium.pdf_images import ExtractedImage, ImageHarvest
 from scriptorium.pipeline import Pipeline, RunOptions
 from scriptorium.sources import ReadResult
+from scriptorium.state import Stage
 from scriptorium.ui import ConsoleUI
 
 
@@ -201,7 +203,10 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(applied["merged"] or applied["created"])
         report = (job_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("Dry run", report)
-        self.assertFalse((self.home / "history" / f"{state.job_id}.json").exists())
+        history = json.loads(
+            (self.home / "history" / f"{state.job_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(history["status"], "dry_run")
         leftovers = list(Path(tempfile.gettempdir()).glob("scriptorium-dry-run-*"))
         self.assertEqual(leftovers, [], "the sandbox must be deleted at the end")
 
@@ -379,6 +384,40 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(resumed.completed())
         self.assertFalse(resumed.options.get("dry_run"))
         self.assertTrue((self.vault_dir / "Test Note.md").is_file())
+
+
+    def failing_chat(self, system, user, *, phase="llm", **kwargs):
+        if phase == "outline":
+            raise LLMError("model offline")
+        return self.fake_chat(system, user, phase=phase, **kwargs)
+
+    def test_a_failed_run_is_recorded_and_resumable(self):
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", self.fake_transcribe),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self.failing_chat),
+            self.assertRaises(LLMError),
+        ):
+            pipeline = Pipeline(self.config, self.ui, self.logger)
+            pipeline.run([self.video], RunOptions(course="Test Course"))
+
+        state = pipeline.store.recent()[0]
+        self.assertEqual(state.groups[0].status(Stage.OUTLINE), "failed")
+        payload = json.loads(
+            (self.home / "history" / f"{state.job_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("outline", payload["error"])
+        self.assertEqual(
+            [candidate.job_id for candidate in pipeline.store.resumable()], [state.job_id]
+        )
+
+    def test_resume_rejects_a_missing_source(self):
+        state = self.run_pipeline(RunOptions(course="Test Course", dry_run=True))
+        self.video.unlink()
+
+        with self.assertRaises(ConfigurationError):
+            Pipeline(self.config, self.ui, self.logger).resume(state.job_id, RunOptions())
 
 
 if __name__ == "__main__":

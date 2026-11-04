@@ -31,7 +31,8 @@ class SlashCommand:
 SLASH_COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("/run", "start the pipeline with the collected sources"),
     SlashCommand("/new", "clear the current session"),
-    SlashCommand("/history", "browse completed runs and restore one"),
+    SlashCommand("/history", "browse every run and load one"),
+    SlashCommand("/resume", "continue the loaded job after an error"),
     SlashCommand("/wizard", "reopen the first-run setup wizard"),
 )
 

@@ -129,7 +129,7 @@ from .settings import (
 )
 from .slash_commands import SLASH_COMMANDS, SlashCommand, matching_commands
 from .sources import clean_course_name
-from .state import STAGE_LABELS, Stage
+from .state import STAGE_LABELS, JobStore, Stage
 from .tui_completion import (
     CompletionIndex,
     FileMatch,
@@ -209,6 +209,16 @@ class CompletionPopup:
     matches: Sequence[FileMatch | SlashCommand]
     index: int = 0
     is_command: bool = False
+
+
+@dataclass
+class JobRequest:
+    """What the worker thread should start: a fresh run or a resume."""
+
+    sources: list[Path]
+    options: RunOptions
+    status: str
+    job_id: str | None = None
 
 
 @dataclass
@@ -738,7 +748,10 @@ class TuiApp:
                 # steals it from the job state and can be arbitrarily long.
                 # Keep the failure in the log and leave a pointer in the status.
                 self.running = False
-                self.status = "job failed · Ctrl-L for the log"
+                if self.current_job_id:
+                    self.status = "job failed · Ctrl-L for the log · /resume to continue"
+                else:
+                    self.status = "job failed · Ctrl-L for the log"
                 for line in str(payload).splitlines() or [str(payload)]:
                     self._on_log(f"[error] {line}")
                 if self.quit_requested:
@@ -927,6 +940,10 @@ class TuiApp:
             if text == "/history":
                 self._clear_input()
                 self.open_history()
+                return
+            if text == "/resume":
+                self._clear_input()
+                self.start_resume()
                 return
             if text == "/wizard":
                 self._clear_input()
@@ -1171,7 +1188,7 @@ class TuiApp:
             self._load_history(entries[modal.selected])
 
     def _load_history(self, entry: HistoryEntry) -> None:
-        """Restore a snapshot into the panes, as if that run had just finished."""
+        """Load a run into the panes, as if it had just finished or stopped."""
         self.modal = None
         self.current_job_id = entry.job_id or None
         self.source_paths = [Path(path) for path in entry.sources]
@@ -1196,7 +1213,14 @@ class TuiApp:
         self.active = None
         self.completion = None
         self.panes.reset(self)
-        self.status = f"history · {entry.course or entry.job_id}"
+        job_dir = self.config.artifacts_dir / "jobs" / entry.job_id
+        if entry.job_id and job_dir.is_dir():
+            # The job directory outlives the snapshot: show the latest
+            # artifacts, which is what a resume will continue from.
+            self._reload_artifacts()
+        self.status = f"history · {entry.course or entry.job_id} · {entry.status_label}"
+        if entry.resumable:
+            self.status += " · /resume to continue"
 
     def start_job(self) -> None:
         if self.running:
@@ -1225,6 +1249,51 @@ class TuiApp:
             course=course,
             moc=str(self.moc_hint) if self.moc_hint else None,
         )
+        label = sources[0].name if len(sources) == 1 else f"{len(sources)} sources"
+        self._begin_job(
+            JobRequest(
+                sources=sources,
+                options=options,
+                status=f"starting job for {label}",
+            )
+        )
+
+    def start_resume(self) -> None:
+        """Continue the loaded job from its first unfinished stage."""
+        if self.running:
+            self.status = "a job is already running"
+            return
+        if not self.current_job_id:
+            self.status = "no job loaded, pick one with /history"
+            return
+        try:
+            state = JobStore(self.config.artifacts_dir).load(self.current_job_id)
+        except ScriptoriumError as exc:
+            self.status = str(exc)
+            return
+        if state.completed() and not state.options.get("dry_run"):
+            self.status = f"job {state.job_id} is already complete"
+            return
+        missing = [Path(source) for source in state.sources if not path_exists(Path(source))]
+        if missing:
+            self.status = f"source not found: {missing[0]}"
+            return
+        try:
+            llm_api_key(self.config)
+        except ScriptoriumError as exc:
+            self.status = str(exc)
+            return
+        self._begin_job(
+            JobRequest(
+                sources=[Path(source) for source in state.sources],
+                options=RunOptions(),
+                status=f"resuming job {state.job_id}",
+                job_id=state.job_id,
+            )
+        )
+
+    def _begin_job(self, request: JobRequest) -> None:
+        """Reset the run state and start the worker for one request."""
         self.running = True
         self.quit_requested = False
         self.current_stage = ""
@@ -1237,20 +1306,19 @@ class TuiApp:
         self.diff_index = 0
         self.card_index = 0
         self.extras_scroll = 0
-        self.current_job_id = None
-        label = sources[0].name if len(sources) == 1 else f"{len(sources)} sources"
-        self.status = f"starting job for {label}"
+        self.current_job_id = request.job_id
+        self.status = request.status
         self.editor.set_mode(self._base_mode())
         self._pull_editor()
         self.worker = threading.Thread(
             target=self._run_worker,
-            args=(sources, options),
+            args=(request,),
             name="scriptorium-worker",
             daemon=True,
         )
         self.worker.start()
 
-    def _run_worker(self, sources: list[Path], options: RunOptions) -> None:
+    def _run_worker(self, request: JobRequest) -> None:
         logger = Logger(
             None,
             verbose=self.verbose,
@@ -1267,7 +1335,10 @@ class TuiApp:
             on_event=lambda event: self.events.put(("event", event)),
         )
         try:
-            state = pipeline.run(sources, options)
+            if request.job_id is None:
+                state = pipeline.run(request.sources, request.options)
+            else:
+                state = pipeline.resume(request.job_id, request.options)
         except Exception as exc:  # keep the TUI alive and show the failure
             self.events.put(("failed", str(exc)))
             return
@@ -3351,7 +3422,7 @@ class TuiApp:
         inner_w = max(1, w - 4)
         display: list[tuple[str, int]] = []
         if not entries:
-            display.append(("No completed runs yet.", 0))
+            display.append(("No runs yet.", 0))
         else:
             for index, entry in enumerate(entries):
                 marker = "› " if index == modal.selected else "  "
@@ -3364,9 +3435,9 @@ class TuiApp:
         y, x, h, w = self._floating_rect(rows, cols, w, height)
         self._fill_rect(y, x, h, w)
         footer = (
-            "j/k choose · Enter restore · Esc close"
+            "j/k choose · Enter load · Esc close"
             if self.vim_movements
-            else "↑/↓ choose · Enter restore · Esc close"
+            else "↑/↓ choose · Enter load · Esc close"
         )
         self._draw_box(y, x, h, w, "Run history", footer, True, [], 0, 0)
         if not entries:

@@ -82,7 +82,7 @@ On the first launch the TUI opens a short setup wizard (vault, model and speech)
 scriptorium
 ```
 
-Collect one or more sources in the Sources pane, type `/run`, and review the proposed note changes and drafted flashcards in the other panes. Merge review and MOC selection happen in modals, so under the default `ask` policy a merge is not applied without review. Type `/wizard` to reopen the setup wizard, or `/history` to restore a completed run.
+Collect one or more sources in the Sources pane, type `/run`, and review the proposed note changes and drafted flashcards in the other panes. Merge review and MOC selection happen in modals, so under the default `ask` policy a merge is not applied without review. `/history` lists every run, completed or failed. Select one and type `/resume` to continue it from the first unfinished stage. Type `/wizard` to reopen the setup wizard.
 
 ### Command line
 
@@ -98,9 +98,18 @@ scriptorium run lecture.mp4 --course "Linear Algebra" --yes
 
 # Plan only, no vault writes
 scriptorium run lecture.mp4 --course "Linear Algebra" --dry-run
+
+# Continue the most recent unfinished job (for example after fixing an error)
+scriptorium resume
+
+# Continue a specific job (an unambiguous id prefix is enough)
+scriptorium resume 20260101-120000-lecture
+
+# Apply the plan saved by a dry run
+scriptorium resume 20260101-120000-lecture --yes
 ```
 
-Run `scriptorium run --help` for the full flag list.
+Run `scriptorium run --help` or `scriptorium resume --help` for the full flag list.
 
 ## Extending the interface
 

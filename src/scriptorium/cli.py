@@ -6,10 +6,12 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import is_first_run, llm_api_key, load_config
-from .errors import ConfigurationError, ScriptoriumError
+from .config import Config, is_first_run, llm_api_key, load_config
+from .errors import ConfigurationError, ScriptoriumError, StageError
+from .history import state_status, status_text
 from .log import Logger
 from .pipeline import Pipeline, RunOptions
+from .state import JobState
 from .ui import ConsoleUI
 
 VERSION = "0.2.0"
@@ -35,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--course", help="Course name used to find the MOC (default: first source name)"
     )
     _add_pipeline_flags(run)
+
+    resume = subparsers.add_parser("resume", help="Continue a job stopped by an error or a dry run")
+    resume.add_argument(
+        "job_id",
+        nargs="?",
+        help="Job id (default: the most recent unfinished job)",
+    )
+    _add_pipeline_flags(resume)
 
     return parser
 
@@ -79,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command is None:
             return run_tui(args)
+        if args.command == "resume":
+            return run_resume(args)
         return run_pipeline(args)
     except ConfigurationError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -102,6 +114,38 @@ def run_tui(args: argparse.Namespace) -> int:
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
+    config, ui, logger = _pipeline_context(args)
+    llm_api_key(config)
+    pipeline = Pipeline(config, ui, logger)
+    state = pipeline.run(args.sources, _run_options(args))
+    _report_finished(config, logger, state)
+    return 0
+
+
+def run_resume(args: argparse.Namespace) -> int:
+    config, ui, logger = _pipeline_context(args)
+    pipeline = Pipeline(config, ui, logger)
+    if args.job_id:
+        state = pipeline.store.resolve(args.job_id)
+    else:
+        candidates = pipeline.store.resumable(limit=1)
+        if not candidates:
+            raise StageError(
+                "no unfinished job to resume. Start one with `scriptorium run <source>`"
+            )
+        state = candidates[0]
+    status, error = state_status(state)
+    if status == "completed":
+        print(f"job {state.job_id} is already complete. Nothing to resume")
+        return 0
+    llm_api_key(config)
+    print(f"resuming {state.job_id} · {state.course} · {status_text(status, error)}")
+    resumed = pipeline.resume(state.job_id, _run_options(args))
+    _report_finished(config, logger, resumed)
+    return 0
+
+
+def _pipeline_context(args: argparse.Namespace) -> tuple[Config, ConsoleUI, Logger]:
     if is_first_run():
         print(
             "first run: start `scriptorium` to run the setup wizard, or edit config.toml",
@@ -116,18 +160,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
         llm_model=args.model,
         llm_base_url=args.llm_base_url,
     )
-    llm_api_key(config)
-
     logger = Logger(None, verbose=args.verbose)
     ui = ConsoleUI(
         yes=args.yes,
         accept_merges=bool(args.accept_merges),
         interactive=False if args.non_interactive else None,
     )
-    pipeline = Pipeline(config, ui, logger)
+    return config, ui, logger
 
-    options = RunOptions(
-        course=args.course or "",
+
+def _run_options(args: argparse.Namespace) -> RunOptions:
+    return RunOptions(
+        course=getattr(args, "course", "") or "",
         moc=args.moc,
         dry_run=args.dry_run,
         accept_merges=args.accept_merges,
@@ -136,13 +180,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
         keep_srt=args.keep_srt,
     )
 
-    state = pipeline.run(args.sources, options)
 
+def _report_finished(config: Config, logger: Logger, state: JobState) -> None:
     report = state.artifacts.get("report")
     if report:
         path = config.artifacts_dir / "jobs" / state.job_id / report
         logger.success(f"job {state.job_id} finished; report: {path}")
-    return 0
 
 
 if __name__ == "__main__":
