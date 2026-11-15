@@ -69,6 +69,7 @@ from scriptorium.tui_layout import (
 from scriptorium.ui import MocDecision
 from scriptorium.vault import MocMatch, Vault
 from scriptorium.vimline import MODE_INSERT, MODE_NORMAL
+from scriptorium.wizard import PAGE_REVIEW, PAGE_SPEECH, REVIEW_WARNING
 
 
 def _tab_to(app, section: str):
@@ -830,13 +831,26 @@ class ExtrasExportTests(unittest.TestCase):
         copy.assert_not_called()
         self.assertEqual(app.status, "no extras to copy")
 
+    def test_enter_on_a_root_only_selects_it(self):
+        app = self._app_with_asides()
+        app._handle_active_key("w")
+        app._handle_modal_key("\n")
+        target = self.exports / "extras.md"
+        self.assertFalse(target.exists())
+        assert app.modal is not None
+        self.assertEqual(app.modal.payload["target"], str(target))
+        self.assertIn("press y", app.modal.message)
+        app._handle_modal_key("y")
+        self.assertTrue(target.is_file())
+        self.assertIsNone(app.modal)
+
     def test_w_key_writes_to_a_configured_root_and_appends_next_time(self):
         app = self._app_with_asides()
         app._handle_active_key("w")
         self.assertIsNotNone(app.modal)
         assert app.modal is not None
         self.assertEqual(app.modal.kind, "extras_export")
-        app._handle_modal_key("\n")
+        app._handle_modal_key("y")
         target = self.exports / "extras.md"
         self.assertTrue(target.is_file())
         self.assertIsNone(app.modal)
@@ -844,7 +858,7 @@ class ExtrasExportTests(unittest.TestCase):
 
         app.asides = [Aside(kind="link", text="See the course page.")]
         app._handle_active_key("w")
-        app._handle_modal_key("\n")
+        app._handle_modal_key("y")
         text = target.read_text(encoding="utf-8")
         self.assertIn("The exam is oral.", text)
         self.assertIn("See the course page.", text)
@@ -873,7 +887,13 @@ class ExtrasExportTests(unittest.TestCase):
         self.assertEqual(modal.editor.text, str(folder / "notes.md"))
         app._handle_modal_key("\n")
         self.assertIsNone(modal.completion)
+        # The first Enter closes the completion popup, the second accepts the
+        # typed path; the write itself needs ``y``.
         app._handle_modal_key("\n")
+        self.assertIsNone(modal.editor)
+        self.assertEqual((folder / "notes.md").read_text(encoding="utf-8"), "")
+        self.assertIsNotNone(app.modal)
+        app._handle_modal_key("y")
         self.assertIsNone(app.modal)
         self.assertIn("The exam is oral.", (folder / "notes.md").read_text(encoding="utf-8"))
 
@@ -2500,6 +2520,105 @@ class MocModalTests(unittest.TestCase):
             for y in range(app.scr.rows)
         )
         self.assertIn("Select an existing MOC", text)
+
+
+class WizardReviewTests(unittest.TestCase):
+    """Enter selects; only ``y`` confirms the config write on the review page."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+        self.config = Config(
+            notes_root=self.vault,
+            artifacts_dir=self.root / "home",
+            search_paths=(self.root,),
+        )
+        self.written: dict[str, object] = {}
+        self._write = mock.patch(
+            "scriptorium.tui.write_config_values",
+            side_effect=lambda values: self.written.update(values),
+        )
+        self._mark = mock.patch("scriptorium.tui.mark_setup_complete")
+        self._write.start()
+        self.mark_mock = self._mark.start()
+
+    def tearDown(self):
+        self._mark.stop()
+        self._write.stop()
+        self._tmp.cleanup()
+
+    def _review_app(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.open_setup_wizard()
+        state = app.wizard
+        assert state is not None
+        state.values["llm_api_key"] = "secret"
+        app._handle_wizard_key("b")  # the first page wraps back to the review
+        self.assertEqual(state.page, PAGE_REVIEW)
+        return app, state
+
+    def test_enter_on_the_review_page_does_not_save(self):
+        app, state = self._review_app()
+        for key in ("\n", "\r", curses.KEY_ENTER, 10, 13):
+            app._handle_wizard_key(key)
+            self.assertIsNotNone(app.wizard)
+            self.assertEqual(state.page, PAGE_REVIEW)
+            self.assertFalse(state.confirm)
+        self.assertEqual(self.written, {})
+        self.mark_mock.assert_not_called()
+
+    def test_y_saves_from_the_review_page(self):
+        app, _ = self._review_app()
+        app._handle_wizard_key("y")
+        self.assertIsNone(app.wizard)
+        self.assertEqual(self.written["notes_root"], str(self.vault))
+        self.mark_mock.assert_called_once()
+
+    def test_y_warns_before_saving_red_settings(self):
+        app, state = self._review_app()
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            app._handle_wizard_key("y")
+        self.assertIsNotNone(app.wizard)
+        self.assertTrue(state.confirm)
+        self.assertEqual(state.message, REVIEW_WARNING)
+        self.assertEqual(self.written, {})
+        self.mark_mock.assert_not_called()
+
+    def test_failed_save_shows_the_reason_in_the_confirmation_header(self):
+        app, state = self._review_app()
+        state.values["llm_api_key"] = ""
+        with mock.patch.dict("os.environ", {}, clear=True):
+            app._handle_wizard_key("y")
+        self.assertTrue(state.confirm)
+        with mock.patch(
+            "scriptorium.tui.write_config_values",
+            side_effect=OSError("config is read-only"),
+        ):
+            app._handle_wizard_key("y")
+        self.assertIsNotNone(app.wizard)
+        self.assertTrue(state.confirm)
+        self.assertEqual(state.message, "cannot save: config is read-only")
+        app._draw()
+        text = "".join(
+            "".join(app.scr.cells.get((y, x), " ") for x in range(app.scr.cols))
+            for y in range(app.scr.rows)
+        )
+        self.assertIn("cannot save: config is read-only", text)
+        self.assertNotIn(REVIEW_WARNING, text)
+
+    def test_n_and_escape_go_back_from_the_review_page(self):
+        for key in ("n", "\x1b"):
+            with self.subTest(key=key):
+                app, state = self._review_app()
+                app._handle_wizard_key(key)
+                self.assertIsNotNone(app.wizard)
+                self.assertEqual(state.page, PAGE_SPEECH)
+                self.assertEqual(self.written, {})
+                self.mark_mock.assert_not_called()
 
 
 class HistoryAndCommandsTests(unittest.TestCase):
