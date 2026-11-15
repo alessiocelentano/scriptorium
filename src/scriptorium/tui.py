@@ -242,6 +242,7 @@ class SettingsState:
     selected: int = 0
     editing: SettingField | None = None
     adding: bool = False
+    list_index: int = -1
     editor: VimLineEditor | None = None
     completion: CompletionPopup | None = None
     message: str = ""
@@ -2074,6 +2075,7 @@ class TuiApp:
                 state.completion = None
                 state.adding = False
                 state.editing = None
+                state.list_index = -1
                 state.message = ""
                 return
             state.editor.handle_key(key)
@@ -2108,19 +2110,26 @@ class TuiApp:
         field = row.field
 
         if field.kind == KIND_LIST:
+            entries = self._list_value(state, field.key)
             if key in {"a", "+"}:
                 self._begin_field_edit(state, field, adding=True)
                 return
             if key in {"e", "\n", "\r", curses.KEY_ENTER, 10, 13}:
-                entries = self._list_value(state, field.key)
-                self._begin_field_edit(state, field, adding=not entries)
+                # ``row.index`` is the list-entry index; ``state.selected`` is
+                # the row index within the section and only aligned by accident.
+                state.list_index = row.index
+                self._begin_field_edit(state, field, adding=row.index < 0 or not entries)
                 return
             if key in {"d", curses.KEY_DC}:
-                entries = self._list_value(state, field.key)
-                if entries:
-                    del entries[state.selected]
+                if entries and row.index >= 0:
+                    del entries[row.index]
                     state.values[field.key] = entries
-                    state.selected = max(0, min(state.selected, len(entries) - 1))
+                    # ``state.selected`` is a row index, so it is clamped
+                    # against the rows that survive the delete; clamping it
+                    # against the entry count would jump the highlight to an
+                    # unrelated row.
+                    remaining = len(self._section_rows(state))
+                    state.selected = max(0, min(state.selected, remaining - 1))
                     state.message = "removed; press s to save"
             return
 
@@ -2155,7 +2164,10 @@ class TuiApp:
     ) -> None:
         if field.kind == KIND_LIST:
             entries = self._list_value(state, field.key)
-            current = "~/" if adding else str(entries[state.selected])
+            if adding or not 0 <= state.list_index < len(entries):
+                current = "~/"
+            else:
+                current = str(entries[state.list_index])
         else:
             current = str(state.values.get(field.key, ""))
         state.editing = field
@@ -2217,17 +2229,18 @@ class TuiApp:
             return
         if field.kind == KIND_LIST:
             entries = self._list_value(state, field.key)
-            if state.adding or not entries:
+            if state.adding or not 0 <= state.list_index < len(entries):
                 entries.append(converted)
                 state.selected = len(entries) - 1
             else:
-                entries[state.selected] = converted
+                entries[state.list_index] = converted
             state.values[field.key] = entries
         else:
             state.values[field.key] = converted
         state.editor = None
         state.editing = None
         state.adding = False
+        state.list_index = -1
         state.message = "press s to save"
 
     def _convert_field_value(
@@ -2986,12 +2999,29 @@ class TuiApp:
             return
         w = max(28, min(cols - 4, (cols * 3) // 4))
         section_rows = self._section_rows(state)
-        rows_needed = max(12, len(section_rows) + 9)
+        # Sections live in a left column; the active one is highlighted and
+        # the selected section's fields are drawn to its right.
+        label_width = max(len(label) for label in SETTINGS_LABELS.values()) + 3
+        left_w = max(12, min(label_width, (w * 2) // 5))
+        x = max(1, (cols - w) // 2)
+        separator_x = x + left_w + 2
+        content_x = separator_x + 2
+        content_w = max(1, w - left_w - 5)
+        editor_rows = 1 if state.editor is not None else 0
+        # Rows wrap inside the content column, so the window height has to be
+        # sized from the wrapped lines: a long value would otherwise be drawn
+        # below the box's last interior row and clipped away.
+        display: list[tuple[str, int]] = []
+        for index, row in enumerate(section_rows):
+            marker = "› " if index == state.selected else "  "
+            line = marker + self._row_text(state, row)
+            for piece in _wrap(line, content_w):
+                display.append((piece, index))
+        rows_needed = max(12, len(display) + 9)
         if state.editor is not None:
             rows_needed += 1
         h = min(rows - 2, max(rows_needed, rows // 2))
         y = max(1, (rows - h) // 2)
-        x = max(1, (cols - w) // 2)
         footer = (
             "Tab complete · Enter save · Esc cancel"
             if state.editor is not None
@@ -3004,13 +3034,6 @@ class TuiApp:
         self._fill_rect(y, x, h, w)
         self._draw_box(y, x, h, w, "Settings", footer, True, [], 0, 0)
 
-        # Sections live in a left column; the active one is highlighted and
-        # the selected section's fields are drawn to its right.
-        label_width = max(len(label) for label in SETTINGS_LABELS.values()) + 3
-        left_w = max(12, min(label_width, (w * 2) // 5))
-        separator_x = x + left_w + 2
-        content_x = separator_x + 2
-        content_w = max(1, w - left_w - 5)
         # A vertical rule makes the left column read as a section list rather
         # than as a second, unrelated list of values.
         for offset in range(1, h - 1):
@@ -3035,14 +3058,7 @@ class TuiApp:
             )
 
         list_y = y + 2
-        editor_rows = 1 if state.editor is not None else 0
         available = max(1, h - 6 - editor_rows)
-        display: list[tuple[str, int]] = []
-        for index, row in enumerate(section_rows):
-            marker = "› " if index == state.selected else "  "
-            line = marker + self._row_text(state, row)
-            for piece in _wrap(line, content_w):
-                display.append((piece, index))
 
         if display:
             selected_display = 0
