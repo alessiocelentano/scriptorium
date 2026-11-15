@@ -35,6 +35,7 @@ from scriptorium.pane_registry import (
 from scriptorium.panes.changes import ChangesPane
 from scriptorium.panes.input_pane import InputPane
 from scriptorium.panes.logs import LogsPane
+from scriptorium.panes.report import ReportPane
 from scriptorium.tui import TuiApp
 from scriptorium.tui_layout import layout_panes, parse_layout
 
@@ -44,6 +45,7 @@ PANE_MODULES = (
     "scriptorium.panes.flashcards",
     "scriptorium.panes.extras",
     "scriptorium.panes.logs",
+    "scriptorium.panes.report",
     "scriptorium.panes.input_pane",
 )
 
@@ -138,7 +140,7 @@ class PaneModuleIndependenceTests(unittest.TestCase):
     def test_every_builtin_box_is_placeable(self):
         self.assertEqual(
             placeable_names(),
-            ("sources", "changes", "flashcards", "input", "extras", "logs"),
+            ("sources", "changes", "flashcards", "input", "extras", "logs", "report"),
         )
         carved = [name for name in known_names() if name not in placeable_names()]
         self.assertEqual(carved, [])
@@ -294,10 +296,14 @@ class PaneStateTests(unittest.TestCase):
         app.source_index = 0
         app.log_lines = ["one", "two"]
         app.log_scroll = 1
+        app.report_lines = ["# Report"]
+        app.report_scroll = 3
         app._new_session()
         self.assertEqual(app.source_index, 0)
         self.assertEqual(app.source_scroll, 0)
         self.assertEqual(app.log_scroll, 0)
+        self.assertEqual(app.report_lines, [])
+        self.assertEqual(app.report_scroll, 0)
 
     def test_sources_selection_is_clamped_by_the_pane(self):
         pane = self.app().panes["sources"]
@@ -325,8 +331,21 @@ class PaneStateTests(unittest.TestCase):
         app = self.app()
         app._draw()
         text = app.scr.text()
-        for title in ("Sources ·", "Extras ·", "Changes", "Flashcards", "Input"):
+        for title in ("Sources ·", "Extras ·", "Changes", "Flashcards", "Report ·", "Input"):
             self.assertIn(title, text)
+
+    def test_report_pane_renders_loaded_report(self):
+        app = self.app()
+        job_dir = app.config.artifacts_dir / "jobs" / "job-1"
+        job_dir.mkdir(parents=True)
+        (job_dir / "report.md").write_text("# Run report\n\nAll good.", encoding="utf-8")
+        app.current_job_id = "job-1"
+        app._reload_report()
+        app._draw()
+        text = app.scr.text()
+        self.assertIn("Run report", text)
+        self.assertIn("All good.", text)
+        self.assertIn("Report · 3 lines", text)
 
     def test_a_pane_that_is_not_in_the_layout_is_never_drawn(self):
         app = TuiApp(
@@ -359,6 +378,8 @@ class HostCapabilityTests(unittest.TestCase):
         self.assertTrue(InputPane.is_editor)
         self.assertTrue(ChangesPane.owns_merge_review)
         self.assertEqual(LogsPane.spawn_key, "C-l")
+        self.assertEqual(ReportPane.name, "report")
+        self.assertFalse(ReportPane().has_selection())
 
     def test_pane_api_exports_the_public_surface(self):
         for name in (

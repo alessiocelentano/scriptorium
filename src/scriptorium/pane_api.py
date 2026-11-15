@@ -115,6 +115,9 @@ class PaneHost(Protocol):
     extras_scroll: int
     log_lines: list[str]
     log_scroll: int
+    # Run report text (``report.md``) and its read-only scroll offset.
+    report_lines: list[str]
+    report_scroll: int
 
     # Input line state, owned by the input pane but shared with the host.
     input_text: str

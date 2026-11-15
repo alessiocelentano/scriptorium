@@ -30,6 +30,7 @@ BUILTIN_PANES: dict[str, str] = {
     "input": "scriptorium.panes.input_pane:InputPane",
     "extras": "scriptorium.panes.extras:ExtrasPane",
     "logs": "scriptorium.panes.logs:LogsPane",
+    "report": "scriptorium.panes.report:ReportPane",
 }
 
 

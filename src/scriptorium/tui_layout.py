@@ -37,6 +37,7 @@ PANE_CHANGES = "changes"
 PANE_FLASHCARDS = "flashcards"
 PANE_EXTRAS = "extras"
 PANE_LOGS = "logs"
+PANE_REPORT = "report"
 PANE_INPUT = "input"
 #: The panes the built-in default layout places.  A configuration can register
 #: more (``[tui_panes]``); validation takes the name list from the caller.
@@ -46,6 +47,7 @@ PANES = (
     PANE_FLASHCARDS,
     PANE_EXTRAS,
     PANE_LOGS,
+    PANE_REPORT,
     PANE_INPUT,
 )
 DEFAULT_PANES = PANES
@@ -90,10 +92,11 @@ class Split:
 LayoutNode = Leaf | Split
 
 # The default layout: sources above extras on the left, changes in the middle,
-# flashcards above logs on the right, the input line at the bottom.  Extras and
-# logs therefore take half of their column.  The logs box has a spawn key, so
-# it starts hidden and flashcards fills the whole column until that key is
-# pressed.
+# flashcards, logs and the run report stacked on the right, the input line at
+# the bottom.  Extras therefore takes half of the left column and the three
+# right boxes each take a third of theirs.  The logs box has a spawn key, so
+# it starts hidden and the right column redistributes its share to the report
+# and flashcards until that key is pressed.
 DEFAULT_LAYOUT: LayoutNode = Split(
     AXIS_ROWS,
     (
@@ -103,7 +106,17 @@ DEFAULT_LAYOUT: LayoutNode = Split(
                 (
                     (Split(AXIS_ROWS, ((Leaf(PANE_SOURCES), 1), (Leaf(PANE_EXTRAS), 1))), 1),
                     (Leaf(PANE_CHANGES), 1),
-                    (Split(AXIS_ROWS, ((Leaf(PANE_FLASHCARDS), 1), (Leaf(PANE_LOGS), 1))), 1),
+                    (
+                        Split(
+                            AXIS_ROWS,
+                            (
+                                (Leaf(PANE_FLASHCARDS), 1),
+                                (Leaf(PANE_LOGS), 1),
+                                (Leaf(PANE_REPORT), 1),
+                            ),
+                        ),
+                        1,
+                    ),
                 ),
             ),
             1,

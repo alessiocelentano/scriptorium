@@ -44,6 +44,7 @@ from scriptorium.tui_data import (
     load_asides,
     load_card_groups,
     load_diff_entries,
+    load_report_lines,
 )
 from scriptorium.tui_input import (
     clean_course_name,
@@ -386,6 +387,14 @@ class TuiDataTests(unittest.TestCase):
         asides = load_asides(plan_path, extract_path)
         self.assertEqual(asides[0].kind, "link")
         self.assertEqual(asides[0].source, "lecture.mp4 00:01:00")
+
+    def test_load_report_lines(self):
+        path = self.root / "report.md"
+        path.write_text("# Run report\n\nAll good.\n", encoding="utf-8")
+        self.assertEqual(load_report_lines(path), ["# Run report", "", "All good."])
+
+    def test_load_report_lines_is_empty_for_a_missing_file(self):
+        self.assertEqual(load_report_lines(self.root / "missing.md"), [])
 
 
 class ConfigWriteTests(unittest.TestCase):
@@ -1010,19 +1019,24 @@ class LayoutTests(unittest.TestCase):
         self.assertGreater(input_rect.y, changes.y)
         self.assertEqual(input_rect.h, 3)
 
-    def test_extras_and_logs_take_half_of_their_column(self):
+    def test_extras_takes_half_and_right_panes_share_a_third(self):
         rects = pane_rects(DEFAULT_LAYOUT, 30, 120)
         sources = rects["sources"]
         extras = rects["extras"]
         flashcards = rects["flashcards"]
         logs = rects["logs"]
+        report = rects["report"]
         self.assertEqual((sources.x, sources.w), (extras.x, extras.w))
         self.assertEqual((flashcards.x, flashcards.w), (logs.x, logs.w))
+        self.assertEqual((flashcards.x, flashcards.w), (report.x, report.w))
         self.assertEqual(sources.h, extras.h)
         self.assertEqual(flashcards.h, logs.h)
+        self.assertLessEqual(abs(flashcards.h - report.h), 1)
         self.assertEqual(extras.y, sources.bottom)
         self.assertEqual(logs.y, flashcards.bottom)
+        self.assertEqual(report.y, logs.bottom)
         self.assertEqual(sources.h + extras.h, rects["changes"].h)
+        self.assertEqual(flashcards.h + logs.h + report.h, rects["changes"].h)
         self.assertEqual(extras.bottom, rects["input"].y)
         self.assertEqual(rects["input"].h, 3)
         self.assertEqual(rects["input"].bottom, 30)
@@ -1065,6 +1079,7 @@ class LayoutTests(unittest.TestCase):
             self.assertEqual(rects["input"].bottom, rows)
             self.assertGreaterEqual(rects["extras"].h, 1, f"terminal of {rows} rows")
             self.assertGreaterEqual(rects["logs"].h, 1, f"terminal of {rows} rows")
+            self.assertGreaterEqual(rects["report"].h, 1, f"terminal of {rows} rows")
 
     def test_a_short_terminal_shrinks_the_other_rows_before_the_input_line(self):
         rects = pane_rects(DEFAULT_LAYOUT, 8, 120)
@@ -1122,10 +1137,11 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(first.children[0][0], Leaf("sources"))
 
     def test_default_navigation_is_spatial(self):
-        self.assertEqual(neighbor(DEFAULT_LAYOUT, "changes", "l", 30, 120), "flashcards")
+        self.assertEqual(neighbor(DEFAULT_LAYOUT, "changes", "l", 30, 120), "logs")
         self.assertEqual(neighbor(DEFAULT_LAYOUT, "flashcards", "h", 30, 120), "changes")
         self.assertEqual(neighbor(DEFAULT_LAYOUT, "changes", "j", 30, 120), "input")
         self.assertEqual(neighbor(DEFAULT_LAYOUT, "flashcards", "j", 30, 120), "logs")
+        self.assertEqual(neighbor(DEFAULT_LAYOUT, "logs", "j", 30, 120), "report")
         self.assertEqual(neighbor(DEFAULT_LAYOUT, "input", "k", 30, 120), "changes")
         self.assertIsNone(neighbor(DEFAULT_LAYOUT, "input", "h", 30, 120))
 
@@ -1141,11 +1157,11 @@ class LayoutTests(unittest.TestCase):
         # The input line spans the whole width, so the remembered horizontal
         # position decides which top box is above it.
         self.assertEqual(neighbor_rects(rects, "input", "k", point=(2.0, 28.0)), "extras")
-        self.assertEqual(neighbor_rects(rects, "input", "k", point=(118.0, 28.0)), "logs")
+        self.assertEqual(neighbor_rects(rects, "input", "k", point=(118.0, 28.0)), "report")
         # Leaving the right edge and turning up lands on the right box.
         input_rect = rects["input"]
         anchor = edge_point(input_rect, "l", (input_rect.center_x, input_rect.center_y))
-        self.assertEqual(neighbor_rects(rects, "input", "k", point=anchor), "logs")
+        self.assertEqual(neighbor_rects(rects, "input", "k", point=anchor), "report")
 
     def test_right_then_up_uses_the_anchor_in_a_custom_layout(self):
         layout = parse_layout(["sources | flashcards", "input | changes"])
@@ -2048,6 +2064,8 @@ class LogWindowTests(unittest.TestCase):
         app._handle_normal_key("j")
         self.assertEqual(app.focus, "logs")
         app._handle_normal_key("j")
+        self.assertEqual(app.focus, "report")
+        app._handle_normal_key("j")
         self.assertEqual(app.focus, "input")
 
     def test_the_log_viewer_scrolls_with_the_arrow_keys_in_vim_mode(self):
@@ -2066,6 +2084,20 @@ class LogWindowTests(unittest.TestCase):
         app._handle_normal_key(curses.KEY_PPAGE)
         self.assertEqual(app.log_scroll, 10)
 
+    def test_a_focused_report_pane_scrolls_before_it_is_activated(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.report_lines = [f"line {index}" for index in range(200)]
+        app.focus = "report"
+        app.active = None
+        app.report_scroll = 10
+        app._handle_normal_key(curses.KEY_NPAGE)
+        self.assertGreater(app.report_scroll, 10)
+        app._handle_normal_key(curses.KEY_PPAGE)
+        self.assertEqual(app.report_scroll, 10)
+        app._handle_normal_key(curses.KEY_DOWN)
+        self.assertEqual(app.report_scroll, 11)
+
     def test_a_direction_without_a_pane_still_moves_the_anchor(self):
         app = TuiApp(config=self.config)
         app.scr = FakeScreen()
@@ -2074,7 +2106,7 @@ class LogWindowTests(unittest.TestCase):
         self.assertEqual(app.focus, "input")
         self.assertEqual(app.status, "ready")
         app._move_focus("k")
-        self.assertEqual(app.focus, "flashcards")
+        self.assertEqual(app.focus, "report")
 
     def test_standard_mode_arrows_leave_the_log_viewer(self):
         config = Config(
@@ -2129,10 +2161,10 @@ class LogWindowTests(unittest.TestCase):
         input_row = next(index for index, line in enumerate(after) if "›" in line)
         self.assertGreater(logs_row, cards_row)
         self.assertLess(logs_row, input_row)
-        extras_row = next(index for index, line in enumerate(after) if "Extras ·" in line)
-        # Extras takes the lower half of the left column, beside the log window.
-        self.assertLessEqual(extras_row, logs_row)
-        self.assertLess(extras_row, input_row)
+        report_row = next(index for index, line in enumerate(after) if "Report ·" in line)
+        # The report sits below the log window and above the input line.
+        self.assertGreater(report_row, logs_row)
+        self.assertLess(report_row, input_row)
 
     def test_the_settings_window_is_opaque_and_restores_what_it_covers(self):
         app = TuiApp(config=self.config)
@@ -2292,6 +2324,21 @@ class LogWindowTests(unittest.TestCase):
         app._draw()
         header = "".join(app.scr.cells.get((0, x), " ") for x in range(app.scr.cols))
         self.assertNotIn("first line", header)
+
+    def test_a_failed_run_loads_the_report(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.current_job_id = "job-1"
+        job_dir = app.config.artifacts_dir / "jobs" / "job-1"
+        job_dir.mkdir(parents=True)
+        (job_dir / "report.md").write_text(
+            "# Run report\n\nFailed during compose.\n", encoding="utf-8"
+        )
+        app.running = True
+        app.events.put(("failed", "boom"))
+        app._drain_events()
+        self.assertFalse(app.running)
+        self.assertEqual(app.report_lines, ["# Run report", "", "Failed during compose."])
 
     def test_header_shows_the_ctrl_l_log_hint_and_settings(self):
         app = TuiApp(config=self.config)

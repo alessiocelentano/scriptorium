@@ -37,16 +37,16 @@ search_paths = []
 #
 # A list is shorthand for stacking rows: each string is one row and its "|"
 # splits are local to that row.  One expression string works too:
-#   tui_layout = "((sources / extras) | changes | (flashcards / logs)) / input"
+#   tui_layout = "((sources / extras) | changes | (flashcards / logs / report)) / input"
 #
 # Every name must be a registered pane (see `[tui_panes]` below) and may appear
 # only once.  The input line is required.  A pane with a spawn key stays hidden
 # until that key is pressed; while hidden it is pruned from the tree, its share
 # goes to its siblings, and a split left with one child collapses into it.
-# That is how "logs" takes half of the flashcards column only after Ctrl-L.
-# Create your own pane using the API provided and your AI agent!
+# That is how "logs" shares the right column with flashcards and report only
+# after Ctrl-L.  Create your own pane using the API provided and your AI agent!
 tui_layout = [
-  "(sources / extras) | changes | (flashcards / logs)",
+  "(sources / extras) | changes | (flashcards / logs / report)",
   "input",
 ]
 
@@ -220,4 +220,7 @@ target = "scriptorium.panes.extras:ExtrasPane"
 
 [tui_panes.logs]
 target = "scriptorium.panes.logs:LogsPane"
+
+[tui_panes.report]
+target = "scriptorium.panes.report:ReportPane"
 
