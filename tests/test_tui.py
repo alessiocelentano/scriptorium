@@ -2320,6 +2320,195 @@ class LogWindowTests(unittest.TestCase):
         self.assertNotIn("s settings", text.split("Input", 1)[1])
 
 
+class ScrollablePaneTests(unittest.TestCase):
+    """The shared pager primitive drives Logs, Changes and Extras."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.vault = self.root / "vault"
+        self.vault.mkdir()
+        self.config = Config(notes_root=self.vault, artifacts_dir=self.root / "home")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _app(self, rows=30, cols=120):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen(rows=rows, cols=cols)
+        return app
+
+    def _thumb_cells(self, app, rect):
+        column = rect.x + rect.w - 2
+        return [app.scr.cells.get((y, column), " ") for y in range(rect.y + 1, rect.y + rect.h - 1)]
+
+    def _scroll_step(self, pane, app, *, half):
+        method = getattr(pane, "half_page_height" if half else "page_height")
+        return method(app)
+
+    def _call_hook(self, pane, app, name):
+        return getattr(pane, name)(app)
+
+    def test_logs_half_page_keys_scroll_by_half_a_viewport(self):
+        app = self._app()
+        app.log_lines = [f"line {index}" for index in range(200)]
+        app.set_pane_shown("logs", True)
+        app.focus = "logs"
+        app.log_scroll = 10
+        step = self._scroll_step(app.panes["logs"], app, half=True)
+        self.assertGreater(step, 0)
+        app._handle_normal_key("\x04")  # Ctrl-D
+        self.assertEqual(app.log_scroll, 10 + step)
+        app._handle_normal_key("\x15")  # Ctrl-U
+        self.assertEqual(app.log_scroll, 10)
+
+    def test_logs_page_keys_scroll_by_a_full_page(self):
+        app = self._app()
+        app.log_lines = [f"line {index}" for index in range(200)]
+        app.set_pane_shown("logs", True)
+        app.focus = "logs"
+        app.log_scroll = 10
+        step = self._scroll_step(app.panes["logs"], app, half=False)
+        self.assertGreater(step, 0)
+        app._handle_normal_key("\x06")  # Ctrl-F
+        self.assertEqual(app.log_scroll, 10 + step)
+        app._handle_normal_key("\x02")  # Ctrl-B
+        self.assertEqual(app.log_scroll, 10)
+
+    def test_logs_draws_a_scrollbar_only_when_the_content_overflows(self):
+        app = self._app()
+        app.set_pane_shown("logs", True)
+        app.focus = "logs"
+        app.log_lines = ["only line"]
+        rect = app.layout_rects()["logs"]
+        app.panes["logs"].draw(app, rect)
+        self.assertNotIn("█", self._thumb_cells(app, rect))
+
+        app.log_lines = [f"line {index}" for index in range(200)]
+        app.log_scroll = 0
+        app.panes["logs"].draw(app, rect)
+        cells = self._thumb_cells(app, rect)
+        self.assertIn("█", cells)
+        self.assertIn("│", cells)
+
+    def test_changes_page_keys_move_the_selection(self):
+        app = self._app()
+        app.diff_entries = [
+            DiffEntry(path=f"Note {index}.md", action="create", added=1, group="created")
+            for index in range(40)
+        ]
+        app.focus = "changes"
+        app.diff_index = 0
+        page = self._scroll_step(app.panes["changes"], app, half=False)
+        half = self._scroll_step(app.panes["changes"], app, half=True)
+        self.assertGreater(page, 0)
+        app._handle_normal_key("\x04")  # Ctrl-D
+        self.assertEqual(app.diff_index, half)
+        app._handle_normal_key("\x06")  # Ctrl-F
+        self.assertEqual(app.diff_index, half + page)
+
+    def test_changes_still_toggles_the_selected_entry(self):
+        app = self._app()
+        app.diff_entries = [
+            DiffEntry(path=f"Note {index}.md", action="create", added=1, group="created")
+            for index in range(5)
+        ]
+        app.focus = "changes"
+        app._handle_normal_key("\n")
+        self.assertEqual(app.active, "changes")
+        app._handle_normal_key("j")
+        self.assertEqual(app.diff_index, 1)
+        app._handle_normal_key(" ")
+        self.assertTrue(app.diff_entries[1].expanded)
+
+    def test_extras_half_page_keys_scroll(self):
+        app = self._app()
+        app.asides = [
+            Aside(kind="remark", text=("a long aside " * 20), source="lecture.mp4")
+            for _ in range(20)
+        ]
+        app.focus = "extras"
+        app.extras_scroll = 0
+        step = self._scroll_step(app.panes["extras"], app, half=True)
+        self.assertGreater(step, 0)
+        app._handle_normal_key("\x04")  # Ctrl-D
+        self.assertEqual(app.extras_scroll, step)
+
+    def test_logs_copy_hook_uses_the_clipboard(self):
+        app = self._app()
+        app.log_lines = ["first", "second"]
+        app.copy_text = mock.Mock(return_value=True)
+        self._call_hook(app.panes["logs"], app, "copy")
+        app.copy_text.assert_called_once_with("first\nsecond")
+        self.assertIn("copied 2 log lines", app.status)
+
+    def test_logs_write_hook_writes_to_the_artifacts_dir(self):
+        app = self._app()
+        app.log_lines = ["first", "second"]
+        self._call_hook(app.panes["logs"], app, "write")
+        target = self.config.artifacts_dir / "logs.txt"
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), "first\nsecond\n")
+        self.assertIn("wrote 2 log lines", app.status)
+
+    def test_extras_copy_and_write_hooks_use_host_services(self):
+        app = self._app()
+        app.asides = [Aside(kind="remark", text="hello", source="")]
+        app.copy_text = mock.Mock(return_value=True)
+        app.open_extras_export = mock.Mock()
+        self._call_hook(app.panes["extras"], app, "copy")
+        app.copy_text.assert_called_once()
+        self.assertIn("copied 1 extras", app.status)
+        self._call_hook(app.panes["extras"], app, "write")
+        app.open_extras_export.assert_called_once_with()
+
+    def test_logs_c_and_w_keys_bind_the_hooks(self):
+        app = self._app()
+        app.log_lines = ["first", "second"]
+        app.set_pane_shown("logs", True)
+        app.focus = "logs"
+        app.copy_text = mock.Mock(return_value=True)
+        app._handle_normal_key("c")
+        app.copy_text.assert_called_once_with("first\nsecond")
+        app._handle_normal_key("w")
+        self.assertTrue((self.config.artifacts_dir / "logs.txt").exists())
+
+    def test_all_three_viewers_draw_a_scrollbar_when_content_overflows(self):
+        app = self._app()
+        app.log_lines = [f"line {index}" for index in range(200)]
+        app.set_pane_shown("logs", True)
+        app.focus = "logs"
+        logs_rect = app.layout_rects()["logs"]
+        app.panes["logs"].draw(app, logs_rect)
+        self.assertIn("█", self._thumb_cells(app, logs_rect))
+
+        app = self._app()
+        app.asides = [
+            Aside(kind="remark", text=("long aside " * 40), source="lecture.mp4") for _ in range(20)
+        ]
+        app.focus = "extras"
+        extras_rect = app.layout_rects()["extras"]
+        app.panes["extras"].draw(app, extras_rect)
+        self.assertIn("█", self._thumb_cells(app, extras_rect))
+
+        app = self._app()
+        app.diff_entries = [
+            DiffEntry(
+                path=f"Note {index}.md",
+                action="create",
+                added=1,
+                diff="\n".join(f"+ line {line}" for line in range(20)),
+                expanded=True,
+                group="created",
+            )
+            for index in range(10)
+        ]
+        app.focus = "changes"
+        changes_rect = app.layout_rects()["changes"]
+        app.panes["changes"].draw(app, changes_rect)
+        self.assertIn("█", self._thumb_cells(app, changes_rect))
+
+
 class MocModalTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

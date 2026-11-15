@@ -28,11 +28,14 @@ Everything a box needs is re-exported from `scriptorium.pane_api`:
 ```python
 from scriptorium.pane_api import (
     Pane,          # the base class you subclass
+    ScrollablePane,  # the shared pager for read-only or selectable boxes
     PaneHost,      # the services your box may use (a Protocol, not a class)
     PaneRect,      # rectangle in terminal cells: y, x, h, w
     Row,           # one content row: (text, style)
     MODE_INSERT, MODE_NORMAL,
-    ENTER_KEYS, PAGE_DOWN_KEYS, PAGE_UP_KEYS,
+    ENTER_KEYS,
+    PAGE_DOWN_KEYS, PAGE_UP_KEYS,
+    HALF_PAGE_DOWN_KEYS, HALF_PAGE_UP_KEYS,
     STYLE_DIM, STYLE_HEADING, STYLE_SELECTED,  # ... and the other STYLE_* names
     one_line, clip, wrap, diff_style,
 )
@@ -119,6 +122,73 @@ restore can reset it) and exposes it through these hooks:
 `set_selection` and `set_scroll` must clamp the value themselves (see
 `panes/sources.py`).  The default `draw` keeps the selected row inside the
 viewport.
+
+## The shared scrollable viewer
+
+Logs, Changes and Extras all share one pager primitive instead of re-implementing
+scroll: `ScrollablePane`.  Subclass it for any box that should scroll like
+`less` and show a right-edge scrollbar when the content exceeds the viewport.
+
+```python
+"""A read-only box that scrolls like the built-in log viewer."""
+
+from scriptorium.pane_api import PaneHost, ScrollablePane
+from scriptorium.tui_render import STYLE_DIM, wrap
+
+
+class ReportPane(ScrollablePane):
+    name = "report"
+
+    def has_selection(self) -> bool:
+        return False
+
+    def title(self, host: PaneHost) -> str:
+        return "Report"
+
+    def rows(self, host: PaneHost) -> tuple[list[tuple[str, str]], int]:
+        return [], -1
+
+    def display_lines(self, host: PaneHost) -> list[tuple[str, str]]:
+        lines = []
+        for line in host.log_lines or ["(nothing to report)"]:
+            lines.extend((piece, STYLE_DIM) for piece in wrap(line, self.content_width(host)))
+        return lines
+
+    def scroll(self, host: PaneHost) -> int:
+        return getattr(self, "_scroll", 0)
+
+    def set_scroll(self, host: PaneHost, value: int) -> None:
+        self._scroll = self.clamp_scroll(host, value)
+```
+
+For a read-only box, implement `display_lines(host)` returning the content
+soft-wrapped to `self.content_width(host)`, keep `has_selection()` returning
+False, and map `scroll`/`set_scroll` onto storage your pane owns.  The built-in
+panes store their offset in a dedicated host slot (`log_scroll`, `extras_scroll`,
+`diff_scroll`); an external pane may use an instance attribute, as above, since
+the `PaneHost` surface is fixed.  `ScrollablePane` then provides `j`/`k` line
+scroll, `Ctrl-D`/`Ctrl-U` half page, `Ctrl-F`/`Ctrl-B` and `PgUp`/`PgDn` full
+page, `g`/`G` home/end, the arrows, and the scrollbar.  It also provides two
+optional action hooks, `copy(host)` and `write(host)`, so a pane can decide
+what its clipboard text and its file output are without owning the pager keys:
+
+```python
+    def copy(self, host: PaneHost) -> None:
+        host.copy_text("\n".join(host.log_lines))
+
+    def write(self, host: PaneHost) -> None:
+        target = host.config.artifacts_dir / "report.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(host.log_lines), encoding="utf-8")
+```
+
+The built-in boxes bind these hooks to `c` (copy) and `w` (write); Changes
+leaves both as no-ops because a diff list has no single sensible export target.
+
+For a selectable box (Changes) keep the normal `Pane` selection hooks and
+`rows(host)`; `ScrollablePane` leaves `j`/`k`/`Enter` selection alone and only
+adds the page motions and the scrollbar, so the pager composes with selection
+rather than replacing it.
 
 ## Geometry metadata
 

@@ -7,15 +7,14 @@ It is a navigable box in the layout like any other.
 
 from __future__ import annotations
 
-import curses
 from typing import Any
 
 from ..extra_notes import format_extra_notes
-from ..pane_api import PAGE_DOWN_KEYS, PAGE_UP_KEYS, Pane, PaneHost
+from ..pane_api import PaneHost, PaneRect, ScrollablePane
 from ..tui_render import STYLE_DIM, wrap
 
 
-class ExtrasPane(Pane):
+class ExtrasPane(ScrollablePane):
     """Asides from the extract stage: exam notices, links and curiosities."""
 
     name = "extras"
@@ -52,29 +51,18 @@ class ExtrasPane(Pane):
 
     # -- scroll --------------------------------------------------------------- #
 
-    def display_lines(self, host: PaneHost) -> list[tuple[str, str]]:
+    def display_lines(self, host: PaneHost, rect: PaneRect | None = None) -> list[tuple[str, str]]:
         """Rows soft-wrapped to the current width of the box."""
-        rect = host.layout_rects().get(self.name)
-        width = max(1, (rect.w - 2) if rect is not None else 40)
         lines: list[tuple[str, str]] = []
         for text, style in self.rows(host)[0]:
-            for piece in wrap(text, width):
-                lines.append((piece, style))
+            lines.extend((piece, style) for piece in wrap(text, self.content_width(host, rect)))
         return lines
-
-    def scroll_limit(self, host: PaneHost) -> int:
-        rect = host.layout_rects().get(self.name)
-        inner_h = max(1, (rect.h - 2) if rect is not None else 1)
-        return max(0, len(self.display_lines(host)) - inner_h)
 
     def scroll(self, host: PaneHost) -> int:
         return host.extras_scroll
 
     def set_scroll(self, host: PaneHost, value: int) -> None:
-        host.extras_scroll = max(0, min(self.scroll_limit(host), value))
-
-    def scroll_by(self, host: PaneHost, delta: int) -> None:
-        self.set_scroll(host, self.scroll(host) + delta)
+        host.extras_scroll = self.clamp_scroll(host, value)
 
     def on_asides(self, host: PaneHost) -> None:
         """Keep the scroll inside the content after the host reloads asides."""
@@ -82,7 +70,7 @@ class ExtrasPane(Pane):
 
     # -- actions -------------------------------------------------------------- #
 
-    def _copy(self, host: PaneHost) -> None:
+    def copy(self, host: PaneHost) -> None:
         """Copy every aside to the system clipboard as Markdown text."""
         if not host.asides:
             host.status = "no extras to copy"
@@ -92,14 +80,20 @@ class ExtrasPane(Pane):
         else:
             host.status = "could not copy: no clipboard backend available"
 
+    def write(self, host: PaneHost) -> None:
+        """Offer the configured roots and a free path to write the extras."""
+        host.open_extras_export()
+
     # -- keys ----------------------------------------------------------------- #
 
     def handle_key(self, host: PaneHost, key: Any, *, active: bool) -> bool:
         if key in {"c", "C"}:
-            self._copy(host)
+            self.copy(host)
             return True
         if key in {"w", "W"}:
-            host.open_extras_export()
+            self.write(host)
+            return True
+        if super().handle_key(host, key, active=active):
             return True
         if not active:
             return False
@@ -108,24 +102,5 @@ class ExtrasPane(Pane):
             return True
         if key == "f":
             host.toggle_fullscreen()
-            return True
-        vim = host.vim_movements
-        if key in {curses.KEY_DOWN} or (vim and key == "j"):
-            self.scroll_by(host, 1)
-            return True
-        if key in {curses.KEY_UP} or (vim and key == "k"):
-            self.scroll_by(host, -1)
-            return True
-        if key in PAGE_DOWN_KEYS:
-            self.scroll_by(host, self.page(host, host.layout_rects().get(self.name)))
-            return True
-        if key in PAGE_UP_KEYS:
-            self.scroll_by(host, -self.page(host, host.layout_rects().get(self.name)))
-            return True
-        if key in {"g", curses.KEY_HOME}:
-            self.set_scroll(host, 0)
-            return True
-        if key in {"G", curses.KEY_END}:
-            self.set_scroll(host, self.scroll_limit(host))
             return True
         return False

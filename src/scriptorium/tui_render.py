@@ -166,6 +166,70 @@ class Painter:
             except curses.error:
                 pass
 
+    def draw_lines(
+        self,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+        lines: list[Row],
+        scroll: int,
+        active: bool = False,
+    ) -> int:
+        """Draw pre-wrapped rows inside a box interior and return the scroll.
+
+        ``top``/``left`` is the first content cell; ``width`` is the content
+        width the rows were wrapped to.  The returned scroll is clamped to the
+        last page so a caller can store it as its new scroll position.
+        """
+        if height <= 0 or width <= 0:
+            return 0
+        total = len(lines)
+        scroll = max(0, min(scroll, max(0, total - height)))
+        for offset in range(height):
+            index = scroll + offset
+            if index >= total:
+                break
+            text, style = lines[index]
+            if active and style == STYLE_SELECTED:
+                style = STYLE_ACTIVE
+            self.addstr(top + offset, left, text, self.attr(style))
+        return scroll
+
+    def draw_scrollbar(
+        self,
+        top: int,
+        left: int,
+        height: int,
+        scroll: int,
+        viewport: int,
+        total: int,
+    ) -> None:
+        """Paint a right-edge scrollbar for ``total`` rows in a ``viewport``.
+
+        ``top``/``left`` is the top cell of the track and ``height`` the track
+        height (usually the box interior height).  When the content fits there
+        is no thumb, matching a terminal pager.
+        """
+        if height <= 0 or viewport <= 0 or total <= viewport:
+            return
+        scroll = max(0, min(scroll, max(0, total - viewport)))
+        thumb = max(1, int(height * viewport / total))
+        track = max(1, height)
+        travel = max(1, total - viewport)
+        thumb_top = round(scroll * max(0, track - thumb) / travel)
+        track_attr = self.attr(STYLE_DIM)
+        thumb_attr = self.attr(STYLE_SELECTED)
+        for offset in range(track):
+            is_thumb = thumb_top <= offset < thumb_top + thumb
+            self.addnstr_raw(
+                top + offset,
+                left,
+                "█" if is_thumb else "│",
+                1,
+                thumb_attr if is_thumb else track_attr,
+            )
+
     def draw_box(
         self,
         y: int,
@@ -179,12 +243,15 @@ class Painter:
         scroll: int,
         selected_row: int,
         active: bool = False,
+        scrollbar: bool = False,
     ) -> int:
         """Draw a bordered box and return the scroll offset actually used.
 
         Long rows wrap instead of being clipped; ``scroll`` is a display-row
         offset and the selected logical row is kept inside the viewport, so the
-        caller can store the returned value as its new scroll position.
+        caller can store the returned value as its new scroll position.  When
+        ``scrollbar`` is True the right interior column is reserved for a
+        pager thumb and the content is wrapped one column narrower.
         """
         if h < 3 or w < 4:
             return scroll
@@ -215,7 +282,7 @@ class Painter:
             )
 
         inner_h = max(1, h - 2)
-        inner_w = max(1, w - 2)
+        inner_w = max(1, w - 3) if scrollbar else max(1, w - 2)
         display: list[tuple[str, str, int]] = []
         for index, (text, style) in enumerate(rows):
             for piece in wrap(text, inner_w):
@@ -241,4 +308,6 @@ class Painter:
             if active and style == STYLE_SELECTED:
                 style = STYLE_ACTIVE
             self.addstr(y + 1 + offset, x + 1, text, self.attr(style))
+        if scrollbar:
+            self.draw_scrollbar(y + 1, x + w - 2, inner_h, scroll, inner_h, len(display))
         return scroll
