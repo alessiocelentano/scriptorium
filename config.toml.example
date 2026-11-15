@@ -166,11 +166,12 @@ max_scanned_pages = 100
 
 # How a merge into an existing note is decided. A merge may edit or remove
 # existing lines, so the unified diff is always the thing being approved.
-#   "ask"    - show the diff; apply it, skip it, or write a conflict file.
+#   "ask"    - show the diff; apply it, skip it, or write conflict markers into
+#              the note for manual reconciliation.
 #   "apply"  - apply every composed merge without asking (the diff is still
 #              recorded in the report and in apply.json).
-#   "manual" - never write the note: write a git-style conflict file into the
-#              job directory and let the user reconcile the two versions by hand.
+#   "manual" - always write git-style conflict markers into the note (never
+#              stacked) and report the run as unresolved.
 merge_policy = "ask"
 
 # How the target note of each planned note is chosen.

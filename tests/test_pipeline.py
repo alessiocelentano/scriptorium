@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from scriptorium.log import Logger
 from scriptorium.models import Plan, Segment, Transcript
 from scriptorium.pdf_images import ExtractedImage, ImageHarvest
 from scriptorium.pipeline import Pipeline, RunOptions
+from scriptorium.sandbox import SandboxVault
 from scriptorium.sources import ReadResult
 from scriptorium.state import Stage
 from scriptorium.ui import ConsoleUI
@@ -82,6 +84,29 @@ def compose_response():
                 "kind": "single",
             }
         ],
+    }
+
+
+def merge_outline_response():
+    return {
+        "notes": [
+            {
+                "action": "merge",
+                "path": "Existing.md",
+                "title": "Existing",
+                "anchor": "Section",
+                "unit_ids": ["u1"],
+                "confidence": 0.9,
+            }
+        ],
+        "todos": [],
+    }
+
+
+def merge_compose_response():
+    return {
+        "body": "## Section\n\nrewritten line\n",
+        "flashcards": [],
     }
 
 
@@ -209,6 +234,90 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(history["status"], "dry_run")
         leftovers = list(Path(tempfile.gettempdir()).glob("scriptorium-dry-run-*"))
         self.assertEqual(leftovers, [], "the sandbox must be deleted at the end")
+
+    def _merge_chat(self, system, user, *, phase="llm", temperature=0.2, max_tokens=8192):
+        if phase == "extract":
+            return extract_response()
+        if phase == "group":
+            return group_response()
+        if phase == "outline":
+            return merge_outline_response()
+        return merge_compose_response()
+
+    def test_dry_run_manual_policy_writes_markers_into_the_sandbox_and_conflict_copy(self):
+        config = self.config.with_overrides(merge_policy="manual")
+        original_create = SandboxVault.create
+        created: list[SandboxVault] = []
+
+        def capture_create(background, *, prefix="scriptorium-dry-run-"):
+            sandbox = original_create(background, prefix=prefix)
+            sandbox.discard = lambda: None
+            created.append(sandbox)
+            return sandbox
+
+        original = (self.vault_dir / "Existing.md").read_text(encoding="utf-8")
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", self.fake_transcribe),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self._merge_chat),
+            mock.patch.object(SandboxVault, "create", capture_create),
+        ):
+            pipeline = Pipeline(config, self.ui, self.logger)
+            state = pipeline.run([self.video], RunOptions(course="Test Course", dry_run=True))
+
+        sandbox = created[0]
+        self.addCleanup(lambda: shutil.rmtree(sandbox.directory, ignore_errors=True))
+
+        self.assertEqual((self.vault_dir / "Existing.md").read_text(encoding="utf-8"), original)
+        overlay = (sandbox.directory / "Existing.md").read_text(encoding="utf-8")
+        self.assertIn("<<<<<<< existing", overlay)
+        self.assertIn("old", overlay)
+        self.assertIn("rewritten line", overlay)
+        self.assertIn(">>>>>>> scriptorium", overlay)
+
+        job_dir = self.home / "jobs" / state.job_id
+        copies = list((job_dir / "merges").glob("*.merge.conflict.md"))
+        self.assertEqual(len(copies), 1)
+        copy = copies[0].read_text(encoding="utf-8")
+        self.assertIn("old", copy)
+        self.assertIn("rewritten line", copy)
+        applied = json.loads((job_dir / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(applied["conflicts"]), 1)
+        report = (job_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("- Status: planned", report)
+        self.assertIn("Dry run", report)
+        history = json.loads(
+            (self.home / "history" / f"{state.job_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(history["status"], "dry_run")
+
+    def test_manual_merge_marks_the_job_as_having_unresolved_conflicts(self):
+        config = self.config.with_overrides(merge_policy="manual")
+        with (
+            mock.patch("scriptorium.pipeline.to_mp3", self.fake_to_mp3),
+            mock.patch("scriptorium.asr.LocalTranscriber.transcribe", self.fake_transcribe),
+            mock.patch("scriptorium.llm.client.DeepSeekClient.chat_json", self._merge_chat),
+        ):
+            pipeline = Pipeline(config, self.ui, self.logger)
+            state = pipeline.run([self.video], RunOptions(course="Test Course"))
+
+        self.assertTrue(state.completed())
+        self.assertTrue(state.unresolved_conflicts)
+        self.assertIn(
+            "<<<<<<< existing",
+            (self.vault_dir / "Existing.md").read_text(encoding="utf-8"),
+        )
+
+        job_dir = self.home / "jobs" / state.job_id
+        copies = list((job_dir / "merges").glob("*.merge.conflict.md"))
+        self.assertEqual(len(copies), 1)
+        applied = json.loads((job_dir / "apply.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(applied["conflicts"]), 1)
+        history = json.loads(
+            (self.home / "history" / f"{state.job_id}.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(history["status"], "unresolved_conflicts")
+        self.assertIn(state.job_id, [candidate.job_id for candidate in pipeline.store.resumable()])
 
     def test_sources_are_processed_in_topic_groups(self):
         notes = self.root / "notes.md"

@@ -47,7 +47,7 @@ The next sections will describe in more detail and more formally (i.e., they are
 - **Any source, mixed freely.** Lectures, slides, PDFs, notes and spreadsheets can be combined in one run. A recording can be added later and merged into the notes created from the slides.
 - **Local speech recognition, or a remote endpoint.** A local transformers speech-to-text model runs on the machine. An OpenAI-compatible `/audio/transcriptions` endpoint or a Hugging Face router/Inference Endpoint is one setting away, and with the endpoint the sources are transcribed concurrently within a configurable request budget.
 - **The model never writes files.** It returns JSON validated by pydantic and applied by a deterministic applier.
-- **Safe writes.** Appends are insert-only: the write is diff-checked and rolled back if any pre-existing line changed. Merges rewrite only the anchored section and are reviewed through their unified diff, or written as a conflict file outside the vault for manual reconciliation.
+- **Safe writes.** Appends are insert-only: the write is diff-checked and rolled back if any pre-existing line changed. Merges rewrite only the anchored section and are reviewed through their unified diff; a manual merge writes git-style conflict markers into the note (never stacked), keeps a copy in the job directory for inspection, and is reported as unresolved.
 - **PDF figures.** Images are extracted, deduplicated, given a caption and nearby text when available, and embedded only when the note that references them is actually written.
 - **Scanned pages.** Pages without a text layer are read by a vision model or locally with Tesseract.
 - **Idempotent stages.** Each stage records its status and artifacts in the job directory, so completed work is not repeated.

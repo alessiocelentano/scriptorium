@@ -196,6 +196,7 @@ class RunStatusTests(unittest.TestCase):
         self.assertEqual(status_text("completed"), "completed")
         self.assertEqual(status_text("running"), "in progress")
         self.assertEqual(status_text("dry_run"), "dry run · ready to apply")
+        self.assertEqual(status_text("unresolved_conflicts"), "unresolved conflicts")
         self.assertEqual(status_text("failed", "outline: boom"), "failed at outline")
         self.assertEqual(status_text("failed"), "failed")
         self.assertEqual(status_text("incomplete"), "incomplete")
@@ -220,6 +221,25 @@ class RunStatusTests(unittest.TestCase):
             state.groups = [group]
             self.assertEqual(state_status(state), ("completed", ""))
 
+            state.options["dry_run"] = True
+            self.assertEqual(state_status(state), ("dry_run", ""))
+
+    def test_state_status_reports_unresolved_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = JobState(
+                job_id="job-1",
+                video=str(Path(directory) / "lecture.mp4"),
+                course="Course",
+            )
+            for stage in GLOBAL_STAGES:
+                state.set_status(stage, "done")
+            group = GroupState(id="g1", topic="Topic")
+            for stage in GROUP_STAGES:
+                group.set_status(stage, "done")
+            state.groups = [group]
+            state.unresolved_conflicts = True
+
+            self.assertEqual(state_status(state), ("unresolved_conflicts", ""))
             state.options["dry_run"] = True
             self.assertEqual(state_status(state), ("dry_run", ""))
 

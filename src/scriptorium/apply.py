@@ -12,6 +12,7 @@ from .models import Plan, PlannedNote, TodoItem, heading_level_and_text
 from .planning import moc_headings
 from .ui import ConsoleUI
 from .vault import ChangeRecord, Vault
+from .warnings import RunWarning, WarningCode
 
 
 @dataclass
@@ -21,9 +22,10 @@ class ApplyResult:
     moc: list[ChangeRecord] = field(default_factory=list)
     applied_paths: list[str] = field(default_factory=list)
     skipped_merges: list[str] = field(default_factory=list)
-    conflicts: list[str] = field(default_factory=list)
+    conflicts: list[ChangeRecord] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
     todos: list[TodoItem] = field(default_factory=list)
+    warnings: list[RunWarning] = field(default_factory=list)
 
 
 def apply_plan(
@@ -129,7 +131,7 @@ def _apply_merges(
             decision = "apply"
         elif merge_policy == "apply":
             decision = "apply"
-        elif merge_policy == "manual":
+        elif merge_policy == "manual" and note.action == "merge":
             decision = "manual"
         else:
             decision = ui.review_merge(note, diff)
@@ -142,31 +144,96 @@ def _apply_merges(
             elif decision not in {"apply", "skip", "manual"}:
                 decision = "skip"
 
+        if decision == "manual" and note.action != "merge":
+            decision = "skip"
+
         if decision == "manual":
-            conflict = _write_conflict(conflict_dir, vault, note)
-            if conflict is None:
-                result.skipped_merges.append(note.path)
+            try:
+                existing = _existing_body(vault, note)
+            except VaultError as exc:
+                result.refused.append(note.path)
                 result.todos.append(
                     TodoItem(
                         kind="review",
-                        text=f"Merge into {note.path} needs a manual review; no job "
-                        "directory is available for the conflict file.",
+                        text=f"Could not merge into {note.path}: {exc}",
                         note_path=note.path,
                     )
                 )
+                logger.error(f"merge refused for {note.path}: {exc}")
                 continue
-            result.conflicts.append(conflict)
+            if _target_has_markers(vault, note):
+                result.skipped_merges.append(note.path)
+                result.warnings.append(
+                    RunWarning(
+                        code=WarningCode.UNRESOLVED_CONFLICT_MARKERS,
+                        message=(
+                            f"{note.path} already contains conflict markers; skipped the "
+                            "manual merge to avoid stacking them."
+                        ),
+                        source=note.path,
+                    )
+                )
+                result.todos.append(
+                    TodoItem(
+                        kind="restructure",
+                        text=(
+                            f"Manual merge for {note.path} was skipped because the note "
+                            "already contains unresolved conflict markers."
+                        ),
+                        note_path=note.path,
+                    )
+                )
+                logger.warn(f"{note.path}: already has conflict markers; left the note alone")
+                continue
+            proposed = _proposed_body(note)
+            conflict_copy = _write_conflict(conflict_dir, note, existing, proposed)
+            try:
+                conflict_text = _manual_merge_text(vault, note, existing, proposed)
+            except VaultError as exc:
+                result.refused.append(note.path)
+                result.todos.append(
+                    TodoItem(
+                        kind="review",
+                        text=f"Could not merge into {note.path}: {exc}",
+                        note_path=note.path,
+                    )
+                )
+                logger.error(f"merge refused for {note.path}: {exc}")
+                continue
+            try:
+                record = vault.apply_change(
+                    note.path,
+                    conflict_text,
+                    action="conflict",
+                    expect_only_additions=False,
+                )
+            except VaultError as exc:
+                result.refused.append(note.path)
+                result.todos.append(
+                    TodoItem(
+                        kind="review",
+                        text=f"Could not merge into {note.path}: {exc}",
+                        note_path=note.path,
+                    )
+                )
+                logger.error(f"merge refused for {note.path}: {exc}")
+                continue
+            record.notes = "resolve in the note"
+            result.conflicts.append(record)
             result.todos.append(
                 TodoItem(
                     kind="restructure",
                     text=(
-                        f"Manual merge for {note.path}: edit the note yourself using the "
-                        f"conflict file {conflict}; Scriptorium did not write the note."
+                        f"Manual merge for {note.path}: resolve the conflict markers in "
+                        f"the note" + (f" (see {conflict_copy})" if conflict_copy else "") + "."
                     ),
                     note_path=note.path,
                 )
             )
-            logger.info(f"wrote merge conflict file {conflict}")
+            logger.info(
+                f"wrote merge conflict markers into {note.path}"
+                + (f"; copy: {conflict_copy}" if conflict_copy else "")
+            )
             continue
 
         if decision != "apply":
@@ -206,9 +273,16 @@ def _apply_merges(
         result.merged.append(record)
         result.applied_paths.append(note.path)
         logger.success(
-            f"merged into {note.path} (+{record.added_lines} lines, "
-            f"-{record.removed_lines} lines)"
+            f"merged into {note.path} (+{record.added_lines} lines, -{record.removed_lines} lines)"
         )
+
+
+def _merged_block(note: PlannedNote) -> str:
+    block = note.body
+    first = block.splitlines()[0] if block.splitlines() else ""
+    if not heading_level_and_text(first):
+        block = f"## {note.anchor}\n\n{block}".strip()
+    return block
 
 
 def _merged_text(vault: Vault, note: PlannedNote) -> str:
@@ -216,14 +290,72 @@ def _merged_text(vault: Vault, note: PlannedNote) -> str:
         # A reviewed merge replaces the whole section, heading included.  If the
         # model forgot the heading, put it back: otherwise the section would lose
         # its title and the following heading would absorb its body.
-        block = note.body
-        first = block.splitlines()[0] if block.splitlines() else ""
-        if not heading_level_and_text(first):
-            block = f"## {note.anchor}\n\n{block}".strip()
-        return vault.replace_section(note.path, note.anchor, block)
+        return vault.replace_section(note.path, note.anchor, _merged_block(note))
     if note.anchor:
         return vault.insert_under_heading(note.path, note.anchor, note.body, tight=False)
     return vault.append_at_end(note.path, "\n" + note.body)
+
+
+def _section_body(text: str) -> str:
+    """Return a section without its leading heading line."""
+    lines = text.splitlines()
+    if lines and heading_level_and_text(lines[0]):
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
+
+
+def _existing_body(vault: Vault, note: PlannedNote) -> str:
+    """The text a manual merge would replace, without the anchor heading."""
+    if not note.anchor:
+        return ""
+    section = vault.section_text_full(note.path, note.anchor)
+    return _section_body(section)
+
+
+def _proposed_body(note: PlannedNote) -> str:
+    """The text the manual merge would have written into the target."""
+    if note.action == "merge" and note.anchor:
+        return _section_body(_merged_block(note))
+    return note.body
+
+
+def _conflict_block(existing: str, proposed: str) -> str:
+    return "\n".join(
+        [
+            "<<<<<<< existing",
+            existing.rstrip("\n"),
+            "=======",
+            proposed.rstrip("\n"),
+            ">>>>>>> scriptorium",
+        ]
+    )
+
+
+def _has_conflict_markers(text: str) -> bool:
+    return any(
+        line.startswith("<<<<<<<") or line.startswith(">>>>>>>") for line in text.splitlines()
+    )
+
+
+def _target_has_markers(vault: Vault, note: PlannedNote) -> bool:
+    """True when the target note already holds an unresolved conflict block."""
+    try:
+        return _has_conflict_markers(vault.read(note.path))
+    except VaultError:
+        return False
+
+
+def _manual_merge_text(
+    vault: Vault,
+    note: PlannedNote,
+    existing: str,
+    proposed: str,
+) -> str:
+    """The note text with conflict markers standing in for the target text."""
+    block = _conflict_block(existing, proposed)
+    if note.anchor:
+        return vault.replace_section_body(note.path, note.anchor, block)
+    return vault.append_at_end(note.path, "\n" + block)
 
 
 def _conflict_path(directory: Path, note: PlannedNote) -> Path:
@@ -233,36 +365,22 @@ def _conflict_path(directory: Path, note: PlannedNote) -> Path:
 
 def _write_conflict(
     directory: Path | None,
-    vault: Vault,
     note: PlannedNote,
+    existing: str,
+    proposed: str,
 ) -> str | None:
-    """Write a git-style conflict file outside the vault; return its path."""
+    """Write a git-style conflict copy into the job directory for inspection."""
     if directory is None:
         return None
-    if note.anchor:
-        try:
-            existing = vault.section_text(note.path, note.anchor, max_chars=200_000)
-        except VaultError:
-            existing = ""
-    else:
-        try:
-            existing = vault.read(note.path)
-        except VaultError:
-            existing = ""
-    proposed = note.body
     block = "\n".join(
         [
             f"# Merge conflict: {note.path}",
-            "# Scriptorium did not write the note. Edit the note by hand, choose what",
-            "# belongs together, then delete the markers below.",
+            "# Scriptorium wrote these markers into the note itself. Edit the note by",
+            "# hand, choose what belongs together, then delete the markers below.",
             f"# Anchor: {note.anchor or '(end of note)'}",
             f"# Action: {note.action}",
             "",
-            f"<<<<<<< existing ({note.path})",
-            existing.rstrip("\n"),
-            "=======",
-            proposed.rstrip("\n"),
-            f">>>>>>> scriptorium ({note.action})",
+            _conflict_block(existing, proposed),
             "",
         ]
     )
@@ -336,9 +454,7 @@ def _update_moc(
     try:
         record = vault.apply_change(moc_path, new_text, action="moc")
     except VaultError as exc:
-        result.todos.append(
-            TodoItem(kind="review", text=f"Could not update {moc_path}: {exc}")
-        )
+        result.todos.append(TodoItem(kind="review", text=f"Could not update {moc_path}: {exc}"))
         return
     result.moc.append(record)
     logger.success(f"updated MOC {moc_path} (+{record.added_lines} lines)")

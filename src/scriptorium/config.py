@@ -91,8 +91,9 @@ DEFAULT_SCANNED_PDF = SCANNED_PDF_VISION
 DEFAULT_MAX_SCANNED_PAGES = 60
 
 # How a merge into an existing note is decided.  "ask" shows the diff and lets
-# the user apply, skip or keep a conflict file; "apply" accepts every reviewed
-# merge; "manual" always writes a conflict file and never touches the vault.
+# the user apply, skip or write conflict markers; "apply" accepts every reviewed
+# merge; "manual" always writes git-style conflict markers into the note and a
+# copy into the job directory for inspection.
 MERGE_POLICIES = ("ask", "apply", "manual")
 DEFAULT_MERGE_POLICY = "ask"
 

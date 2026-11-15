@@ -16,9 +16,12 @@ DeepSeek plan -> Obsidian notes -> draft flashcards. Read `README.md` and
    any append whose unified diff removes or changes a pre-existing line, and restores the
    original bytes. A merge (`action="merge"`) may rewrite the anchored section only
    through `merge_policy`: `ask` (default) shows the unified diff and accepts the write,
-   skips it, or writes a git-style conflict file into the job directory for the user to
-   reconcile by hand; `manual` never writes the vault; `apply` is the explicit opt-in.
-   Never write a merge outside that review path.
+   skips it, or writes git-style conflict markers (`<<<<<<< existing` / `=======` /
+   `>>>>>>> scriptorium`) into the note for the user to reconcile by hand; `manual`
+   always writes those markers; `apply` is the explicit opt-in. Markers are never
+   stacked: if the target already contains `<<<<<<<` or `>>>>>>>`, the note is left
+   alone and an `unresolved_conflict_markers` warning is recorded. Never write a merge
+   outside that review path.
 3. **New notes are automatic; merges require review.** `merge_policy` and
    `--accept-merges` decide; `--accept-merges` applies pending merges without an
    interactive answer.

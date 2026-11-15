@@ -22,7 +22,13 @@ class DiffEntry:
 
     @property
     def title(self) -> str:
-        sign = {"create": "+", "merge": "~", "moc": "~", "update": "~"}.get(self.action, "~")
+        sign = {
+            "create": "+",
+            "merge": "~",
+            "moc": "~",
+            "update": "~",
+            "conflict": "!",
+        }.get(self.action, "~")
         counts = f"+{self.added}" if self.removed == 0 else f"+{self.added} -{self.removed}"
         return f"{sign} {self.path}  ({counts})"
 
@@ -57,7 +63,12 @@ def load_diff_entries(path: Path) -> list[DiffEntry]:
     except (OSError, ValueError):
         return []
     entries: list[DiffEntry] = []
-    for group, key in (("created", "created"), ("merged", "merged"), ("moc", "moc")):
+    for group, key in (
+        ("created", "created"),
+        ("merged", "merged"),
+        ("moc", "moc"),
+        ("conflicts", "conflicts"),
+    ):
         for item in payload.get(key, []):
             entries.append(
                 DiffEntry(
@@ -80,9 +91,7 @@ def load_asides(plan_path: Path, extract_path: Path | None = None) -> list[Aside
     """
     if extract_path is not None and extract_path.is_file():
         try:
-            extract = ExtractResult.model_validate_json(
-                extract_path.read_text(encoding="utf-8")
-            )
+            extract = ExtractResult.model_validate_json(extract_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
         else:

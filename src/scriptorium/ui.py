@@ -132,9 +132,7 @@ class ConsoleUI:
         self.print("  q. abort")
 
         while True:
-            answer = self._ask(
-                f"Choose 1-{len(candidates)} [1], c to create, q to abort: "
-            ).strip()
+            answer = self._ask(f"Choose 1-{len(candidates)} [1], c to create, q to abort: ").strip()
             lowered = answer.lower()
             if lowered == "q":
                 return MocDecision.abort()
@@ -197,8 +195,8 @@ class ConsoleUI:
 
         ``preview`` is the unified diff the merge would write.  A merge may
         change pre-existing lines, so the diff, not the new body, is what the
-        user approves; ``manual`` writes a git-style conflict file outside the
-        vault and leaves the note untouched.
+        user approves; ``manual`` writes git-style conflict markers into the
+        note and a copy into the job directory for inspection.
         """
         if self.accept_merges:
             return "apply"
@@ -217,9 +215,13 @@ class ConsoleUI:
             self.print("  [...]")
         self.print("-" * 60)
         while True:
-            answer = self._ask(
-                "Apply this merge? [y]es / [n]o / [m]anual conflict file / [a]ll / [q]uit: "
-            ).strip().lower()
+            answer = (
+                self._ask(
+                    "Apply this merge? [y]es / [n]o / [m]anual conflict markers / [a]ll / [q]uit: "
+                )
+                .strip()
+                .lower()
+            )
             if answer in {"y", "yes"}:
                 return "apply"
             if answer in {"n", "no", ""}:

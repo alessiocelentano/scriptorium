@@ -119,6 +119,7 @@ class JobState(BaseModel):
     stages: dict[str, str] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
     error: str | None = None
+    unresolved_conflicts: bool = False
     warnings: list[dict[str, str]] = Field(default_factory=list)
     options: dict[str, object] = Field(default_factory=dict)
 
@@ -219,7 +220,7 @@ class JobStore:
         found = [
             state
             for state in self._states()
-            if not (state.completed() and not state.options.get("dry_run"))
+            if (not state.completed() or state.options.get("dry_run") or state.unresolved_conflicts)
         ]
         return found[:limit]
 

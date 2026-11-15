@@ -35,6 +35,7 @@ class WarningCode(StrEnum):
     EXTRACTION_CAPPED = "extraction_capped"
     NOTE_CAP_REACHED = "note_cap_reached"
     MERGE_SKIPPED = "merge_skipped"
+    UNRESOLVED_CONFLICT_MARKERS = "unresolved_conflict_markers"
     WRITE_REFUSED = "write_refused"
     CARDS_EMPTY = "cards_empty"
 
