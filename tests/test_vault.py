@@ -55,6 +55,26 @@ class InsertTests(VaultTestCase):
         with self.assertRaises(VaultError):
             self.vault.insert_under_heading("N.md", "B", "x")
 
+    def test_replace_section_body_preserves_bytes_outside(self):
+        original = (
+            "---\ntags:\n  - cs/ai\n---\n\n## Section A\n\nold line\n\n## Section B\n\ntail\n"
+        )
+        self.write("N.md", original)
+        block = "<<<<<<< existing\nold line\n=======\nnew line\n>>>>>>> scriptorium"
+        result = self.vault.replace_section_body("N.md", "Section A", block)
+        prefix = original.split("## Section A", 1)[0]
+        suffix = original.split("## Section B", 1)[1]
+        self.assertTrue(result.startswith(prefix))
+        self.assertTrue(result.endswith("## Section B" + suffix))
+        self.assertIn("## Section A\n\n<<<<<<< existing", result)
+        self.assertIn("old line\n=======\nnew line", result)
+        self.assertIn(">>>>>>> scriptorium\n\n## Section B", result)
+
+    def test_replace_section_body_missing_heading(self):
+        self.write("N.md", "## A\n")
+        with self.assertRaises(VaultError):
+            self.vault.replace_section_body("N.md", "B", "x")
+
     def test_insert_tight_for_moc(self):
         self.write(
             "MOC.md",
@@ -150,9 +170,7 @@ class InventoryTests(VaultTestCase):
             "convolutional networks backpropagation gradients\n",
         )
         self.write("University/Course B MOC.md", "cooking recipes\n")
-        matches = self.vault.match_moc(
-            "convolutional networks backpropagation gradients"
-        )
+        matches = self.vault.match_moc("convolutional networks backpropagation gradients")
         self.assertEqual(matches[0].path, "University/Course A MOC.md")
 
     def test_sanitize_links(self):

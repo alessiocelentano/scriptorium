@@ -29,6 +29,7 @@ RUNNING = "running"
 COMPLETED = "completed"
 FAILED = "failed"
 DRY_RUN = "dry_run"
+UNRESOLVED_CONFLICTS = "unresolved_conflicts"
 
 
 def status_text(status: str, error: str = "") -> str:
@@ -39,6 +40,8 @@ def status_text(status: str, error: str = "") -> str:
         return "in progress"
     if status == DRY_RUN:
         return "dry run · ready to apply"
+    if status == UNRESOLVED_CONFLICTS:
+        return "unresolved conflicts"
     if status == FAILED:
         stage = (error or "").split(":", 1)[0].strip() if ":" in (error or "") else ""
         return f"failed at {stage}" if stage else "failed"
@@ -48,7 +51,11 @@ def status_text(status: str, error: str = "") -> str:
 def state_status(state: JobState) -> tuple[str, str]:
     """The history status and error for a job state, read from its stages."""
     if state.completed():
-        return (DRY_RUN, "") if state.options.get("dry_run") else (COMPLETED, "")
+        if state.options.get("dry_run"):
+            return DRY_RUN, ""
+        if state.unresolved_conflicts:
+            return UNRESOLVED_CONFLICTS, ""
+        return COMPLETED, ""
     if state.error:
         return FAILED, state.error
     return "incomplete", ""

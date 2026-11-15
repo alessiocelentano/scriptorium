@@ -5,6 +5,7 @@ from pathlib import Path
 from scriptorium.apply import apply_plan, create_note_text, moc_entries
 from scriptorium.log import Logger
 from scriptorium.models import Flashcard, Plan, PlannedNote
+from scriptorium.sandbox import SandboxVault
 from scriptorium.ui import ConsoleUI
 from scriptorium.vault import Vault
 
@@ -105,10 +106,11 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(result.skipped_merges, ["Existing.md"])
         self.assertIn("old line", self.read("Existing.md"))
 
-    def test_manual_policy_writes_a_conflict_file_and_leaves_the_note(self):
+    def test_manual_policy_writes_markers_into_the_note(self):
         self.plan.notes[1].action = "merge"
         self.plan.notes[1].body = "## Section\n\nrewritten line\n"
         conflicts = self.root / "conflicts"
+        original = self.read("Existing.md")
         ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
         result = apply_plan(
             self.plan,
@@ -120,15 +122,167 @@ class ApplyTests(unittest.TestCase):
             merge_policy="manual",
         )
         self.assertEqual(len(result.conflicts), 1)
-        conflict = Path(result.conflicts[0])
-        text = conflict.read_text(encoding="utf-8")
-        self.assertIn("<<<<<<< existing", text)
-        self.assertIn("old line", text)
-        self.assertIn("=======", text)
-        self.assertIn("rewritten line", text)
-        self.assertIn(">>>>>>> scriptorium", text)
-        self.assertIn("old line", self.read("Existing.md"))
-        self.assertTrue(any("Manual merge" in todo.text for todo in result.todos))
+        conflict = result.conflicts[0]
+        self.assertEqual(conflict.path, "Existing.md")
+        self.assertEqual(conflict.action, "conflict")
+        self.assertIn("<<<<<<< existing", conflict.diff)
+
+        note = self.read("Existing.md")
+        prefix = original.split("## Section", 1)[0]
+        self.assertTrue(note.startswith(prefix), "frontmatter must stay byte-identical")
+        self.assertIn("## Section", note)
+        self.assertIn("<<<<<<< existing", note)
+        self.assertIn("old line", note)
+        self.assertIn("=======", note)
+        self.assertIn("rewritten line", note)
+        self.assertIn(">>>>>>> scriptorium", note)
+        self.assertLess(note.index("old line"), note.index("======="))
+        self.assertLess(note.index("======="), note.index("rewritten line"))
+
+        copies = list(conflicts.glob("*.merge.conflict.md"))
+        self.assertEqual(len(copies), 1)
+        copy = copies[0].read_text(encoding="utf-8")
+        self.assertIn("<<<<<<< existing", copy)
+        self.assertIn("old line", copy)
+        self.assertIn("rewritten line", copy)
+        self.assertTrue(any("resolve the conflict markers" in todo.text for todo in result.todos))
+
+    def test_second_manual_merge_skips_when_markers_already_present(self):
+        note = PlannedNote(
+            action="merge",
+            path="Existing.md",
+            title="Existing",
+            anchor="Section",
+            body="## Section\n\nrewritten line\n",
+        )
+        plan = Plan(course="Course", moc_path=None, notes=[note])
+        conflicts = self.root / "conflicts"
+        ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
+        apply_plan(
+            plan,
+            self.vault,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=conflicts,
+            merge_policy="manual",
+        )
+        before = self.read("Existing.md")
+        result = apply_plan(
+            plan,
+            self.vault,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=conflicts,
+            merge_policy="manual",
+        )
+        self.assertEqual(self.read("Existing.md"), before)
+        self.assertIn("Existing.md", result.skipped_merges)
+        self.assertEqual(result.conflicts, [])
+        self.assertIn("unresolved_conflict_markers", [w.code for w in result.warnings])
+
+    def test_manual_merge_skips_when_markers_are_in_another_section(self):
+        (self.root / "Existing.md").write_text(
+            "---\ntags:\n  - cs/ai\n---\n\n## Section\n\nold line\n\n## Other\n\n"
+            "<<<<<<< existing\nkeep\n=======\nother\n>>>>>>> scriptorium\n",
+            encoding="utf-8",
+        )
+        note = PlannedNote(
+            action="merge",
+            path="Existing.md",
+            title="Existing",
+            anchor="Section",
+            body="## Section\n\nrewritten line\n",
+        )
+        plan = Plan(course="Course", moc_path=None, notes=[note])
+        before = self.read("Existing.md")
+        ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
+        result = apply_plan(
+            plan,
+            self.vault,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=self.root / "conflicts",
+            merge_policy="manual",
+        )
+        self.assertEqual(self.read("Existing.md"), before)
+        self.assertIn("Existing.md", result.skipped_merges)
+        self.assertEqual(result.conflicts, [])
+        self.assertIn("unresolved_conflict_markers", [w.code for w in result.warnings])
+
+    def test_manual_merge_dry_run_writes_sandbox_only(self):
+        self.plan.notes[1].action = "merge"
+        self.plan.notes[1].body = "## Section\n\nrewritten line\n"
+        original = self.read("Existing.md")
+        sandbox = SandboxVault.create(self.vault)
+        self.addCleanup(sandbox.discard)
+        conflicts = self.root / "conflicts"
+        ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
+        apply_plan(
+            self.plan,
+            sandbox,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=conflicts,
+            merge_policy="manual",
+        )
+        self.assertEqual(self.read("Existing.md"), original)
+        overlay = (sandbox.directory / "Existing.md").read_text(encoding="utf-8")
+        self.assertIn("<<<<<<< existing", overlay)
+        self.assertIn("old line", overlay)
+        self.assertIn("rewritten line", overlay)
+        self.assertIn(">>>>>>> scriptorium", overlay)
+        self.assertTrue(list(conflicts.glob("*.merge.conflict.md")))
+
+    def test_manual_policy_does_not_turn_an_append_into_markers(self):
+        conflicts = self.root / "conflicts"
+        original = self.read("Existing.md")
+        ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
+        result = apply_plan(
+            self.plan,
+            self.vault,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=conflicts,
+            merge_policy="manual",
+        )
+        self.assertEqual(result.conflicts, [])
+        self.assertIn("Existing.md", result.skipped_merges)
+        self.assertEqual(self.read("Existing.md"), original)
+        self.assertEqual(list(conflicts.glob("*.merge.conflict.md")), [])
+
+    def test_manual_merge_keeps_the_full_section_body(self):
+        long_body = "old " * 50_000 + "TAIL-END"
+        (self.root / "Existing.md").write_text(
+            "---\ntags:\n  - cs/ai\n---\n\n## Section\n\n" + long_body + "\n\n## Next\n\ntail\n",
+            encoding="utf-8",
+        )
+        note = PlannedNote(
+            action="merge",
+            path="Existing.md",
+            title="Existing",
+            anchor="Section",
+            body="## Section\n\nrewritten line\n",
+        )
+        plan = Plan(course="Course", moc_path=None, notes=[note])
+        conflicts = self.root / "conflicts"
+        ui = ConsoleUI(yes=False, accept_merges=False, interactive=False)
+        apply_plan(
+            plan,
+            self.vault,
+            ui,
+            self.logger,
+            accept_merges=False,
+            conflict_dir=conflicts,
+            merge_policy="manual",
+        )
+        self.assertIn("TAIL-END", self.read("Existing.md"))
+        copy = next(conflicts.glob("*.merge.conflict.md")).read_text(encoding="utf-8")
+        self.assertIn("TAIL-END", copy)
 
     def test_refuses_create_inside_university(self):
         plan = Plan(

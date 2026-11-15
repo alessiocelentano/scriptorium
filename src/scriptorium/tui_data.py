@@ -22,7 +22,13 @@ class DiffEntry:
 
     @property
     def title(self) -> str:
-        sign = {"create": "+", "merge": "~", "moc": "~", "update": "~"}.get(self.action, "~")
+        sign = {
+            "create": "+",
+            "merge": "~",
+            "moc": "~",
+            "update": "~",
+            "conflict": "!",
+        }.get(self.action, "~")
         counts = f"+{self.added}" if self.removed == 0 else f"+{self.added} -{self.removed}"
         return f"{sign} {self.path}  ({counts})"
 
@@ -57,7 +63,12 @@ def load_diff_entries(path: Path) -> list[DiffEntry]:
     except (OSError, ValueError):
         return []
     entries: list[DiffEntry] = []
-    for group, key in (("created", "created"), ("merged", "merged"), ("moc", "moc")):
+    for group, key in (
+        ("created", "created"),
+        ("merged", "merged"),
+        ("moc", "moc"),
+        ("conflicts", "conflicts"),
+    ):
         for item in payload.get(key, []):
             entries.append(
                 DiffEntry(

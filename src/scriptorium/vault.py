@@ -255,7 +255,12 @@ class Vault:
 
     # -- section utilities --------------------------------------------------- #
 
-    def section_text(self, relative: str, heading: str, max_chars: int = 4000) -> str:
+    def section_text(self, relative: str, heading: str, max_chars: int | None = 4000) -> str:
+        """Return a section (heading included) up to ``max_chars``.
+
+        ``max_chars=None`` reads the whole section, which a manual merge needs so
+        a conflict copy never loses the tail of a long section.
+        """
         text = self.read(relative)
         lines = text.splitlines()
         target = _normalize_heading(heading)
@@ -276,7 +281,13 @@ class Vault:
                 end = index
                 break
         body = "\n".join(lines[start:end]).strip()
-        return body[:max_chars]
+        if max_chars is not None:
+            body = body[:max_chars]
+        return body
+
+    def section_text_full(self, relative: str, heading: str) -> str:
+        """Return a section (heading included) without truncating its body."""
+        return self.section_text(relative, heading, max_chars=None)
 
     def find_flashcards_heading(self, text: str) -> tuple[int, int] | None:
         """Return (line index, heading level) for a Flashcards heading."""
@@ -314,8 +325,9 @@ class Vault:
 
         Insertions are the safe default: a diff that removes or changes a line
         is rolled back and reported.  ``expect_only_additions=False`` is only for
-        a merge the user reviewed (see ``apply.py``), and it still returns the
-        removed-line count so the report shows the size of the rewrite.
+        a merge the user reviewed or for the git-style conflict markers a manual
+        merge writes (see ``apply.py``), and it still returns the removed-line
+        count so the report shows the size of the rewrite.
         """
         path = self.resolve(relative)
         original = _read_text(path) if path.is_file() else None
@@ -454,6 +466,50 @@ class Vault:
         if end < len(lines) and replacement and replacement[-1].strip() != "":
             replacement = [*replacement, "\n"]
         return "".join(lines[:start] + replacement + lines[end:])
+
+    def replace_section_body(
+        self,
+        relative: str,
+        heading: str,
+        block: str,
+        *,
+        missing_ok: bool = False,
+    ) -> str:
+        """Return the note text with the body of ``heading`` replaced by ``block``.
+
+        The heading line stays in place; ``block`` replaces only the lines after
+        the heading up to the next heading of the same or higher level.  Used by
+        a manual merge, which writes git-style conflict markers into the section
+        without losing the anchor a later run needs to find it again.
+        """
+        text = self.read(relative)
+        lines = text.splitlines(keepends=True)
+        target = _normalize_heading(heading)
+        start = None
+        level = 0
+        for index, line in enumerate(lines):
+            parsed = heading_level_and_text(line)
+            if parsed and _normalize_heading(parsed[1]) == target:
+                start = index
+                level = parsed[0]
+                break
+        if start is None:
+            if missing_ok:
+                return self.append_at_end(relative, block)
+            raise VaultError(f"heading not found in {relative}: {heading!r}")
+
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            parsed = heading_level_and_text(lines[index])
+            if parsed and parsed[0] <= level:
+                end = index
+                break
+
+        block_lines = [line + "\n" for line in block.strip("\n").split("\n")]
+        replacement = ["\n"] + block_lines
+        if end < len(lines) and replacement[-1].strip() != "":
+            replacement = [*replacement, "\n"]
+        return "".join(lines[: start + 1] + replacement + lines[end:])
 
     def append_at_end(self, relative: str, block: str) -> str:
         text = self.read(relative)

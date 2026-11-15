@@ -32,6 +32,7 @@ GROUP_LABELS = (
     ("Created files", "created"),
     ("Added to existing notes", "merged"),
     ("MOC updates", "moc"),
+    ("Conflicts (resolve in the note)", "conflicts"),
 )
 
 #: Merge-review answers: key -> decision forwarded to the pipeline.

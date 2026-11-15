@@ -852,6 +852,8 @@ class TuiApp:
             )
         elif kind == "file_skipped":
             self._on_log(f"{event.get('reason')}: {event.get('path')}")
+        elif kind == "merge_conflict":
+            self._on_log(f"{event.get('reason')}: {event.get('path')}")
         elif kind == "cards_ready":
             self._reload_cards()
         elif kind == "job_done":

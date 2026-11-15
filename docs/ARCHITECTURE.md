@@ -183,10 +183,14 @@ newline. A **merge** (`action="merge"`) replaces the whole anchored section, hea
 included, so it is written with `expect_only_additions=False`; the composer may edit or
 remove existing lines, and the unified diff is what the user approves. The decision is
 `Config.merge_policy`: `ask` (default) shows the diff and accepts `y` / `n` / `m`, where
-`m` writes a git-style conflict file (`<<<<<<< existing`, `=======`, `>>>>>>> scriptorium`)
-into the job directory and leaves the note untouched; `apply` accepts composed merges
-without prompting; `manual` always writes the conflict file. A rejected merge is reported
-as `skipped_merges`, a manual one as `conflicts`, and neither changes the vault.
+`m` writes git-style conflict markers (`<<<<<<< existing`, `=======`, `>>>>>>> scriptorium`)
+into the note in place of the section body, keeping the heading as the anchor, and also
+writes a conflict copy into the job directory for inspection; `apply` accepts composed
+merges without prompting; `manual` always writes the markers. Markers are never stacked:
+when the target already contains `<<<<<<<` or `>>>>>>>`, the note is left alone and an
+`unresolved_conflict_markers` warning is recorded. A rejected merge is reported as
+`skipped_merges`, a manual one as `conflicts`, and the run is reported as unresolved, not
+complete.
 
 New files are created only when the plan says `action="create"` and the path does not
 exist. Paths are resolved and must stay inside the vault root.

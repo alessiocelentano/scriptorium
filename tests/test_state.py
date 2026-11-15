@@ -101,6 +101,14 @@ class StateTests(unittest.TestCase):
         self.assertIn(dry.job_id, ids)
         self.assertIn(unfinished.job_id, ids)
 
+    def test_resumable_keeps_jobs_with_unresolved_conflicts(self):
+        conflicted = self._finished("20260103-120000-gamma")
+        conflicted.unresolved_conflicts = True
+        self.store.save(conflicted)
+
+        ids = [state.job_id for state in self.store.resumable()]
+        self.assertIn(conflicted.job_id, ids)
+
 
 if __name__ == "__main__":
     unittest.main()

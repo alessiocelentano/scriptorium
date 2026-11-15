@@ -784,18 +784,24 @@ class Pipeline:
 
     def _apply(self, state: JobState, group: GroupState) -> None:
         plan = self._plan_for(state, group)
+        dry_run = self._flag(state, "dry_run")
+        accept_merges = self._flag(state, "accept_merges") or (
+            dry_run and self.config.merge_policy != "manual"
+        )
         result = apply_plan(
             plan,
             self.vault,
             self.ui,
             self.logger,
-            accept_merges=self._flag(state, "accept_merges") or self._flag(state, "dry_run"),
+            accept_merges=accept_merges,
             update_moc=not self._flag(state, "no_moc"),
             conflict_dir=self.store.job_dir(state.job_id) / "merges",
             merge_policy=self.config.merge_policy,
         )
         self._publish_images(state, plan, result)
         self._cache.setdefault("applies", {})[group.id] = result
+        for warning in result.warnings:
+            self._warn(warning)
         self._write_json(
             self.store.artifact(state.job_id, f"apply.{group.id}.json"),
             json.dumps(_apply_dict(result), indent=2),
@@ -812,8 +818,8 @@ class Pipeline:
             )
         for path in result.skipped_merges:
             self._emit("file_skipped", path=path, reason="merge needs review")
-        for path in result.conflicts:
-            self._emit("merge_conflict", path=path, reason="manual merge requested")
+        for conflict in result.conflicts:
+            self._emit("merge_conflict", path=conflict.path, reason="resolve in the note")
         for path in result.refused:
             self._emit("file_skipped", path=path, reason="write refused")
 
@@ -831,7 +837,10 @@ class Pipeline:
         for group in state.groups:
             result = applies.get(group.id)
             if result is None:
-                continue
+                try:
+                    result = self._load_apply(group.id)
+                except (StageError, OSError, ValueError, TypeError):
+                    continue
             merged.created.extend(result.created)
             merged.merged.extend(result.merged)
             merged.moc.extend(result.moc)
@@ -841,6 +850,7 @@ class Pipeline:
             merged.refused.extend(result.refused)
             merged.todos.extend(result.todos)
         self._cache["apply_all"] = merged
+        state.unresolved_conflicts = bool(merged.conflicts)
         self._write_json(
             self.store.artifact(state.job_id, "apply.json"),
             json.dumps(_apply_dict(merged), indent=2),
@@ -1177,7 +1187,7 @@ class Pipeline:
         result.moc = [ChangeRecord(**item) for item in payload.get("moc", [])]
         result.applied_paths = payload.get("applied_paths", [])
         result.skipped_merges = payload.get("skipped_merges", [])
-        result.conflicts = payload.get("conflicts", [])
+        result.conflicts = [ChangeRecord(**item) for item in payload.get("conflicts", [])]
         result.refused = payload.get("refused", [])
         result.todos = [TodoItem.model_validate(item) for item in payload.get("todos", [])]
         return result
@@ -1304,6 +1314,8 @@ class Pipeline:
         status = (
             "failed" if failure else ("planned" if self._flag(state, "dry_run") else "complete")
         )
+        if not failure and not self._flag(state, "dry_run") and applied and applied.conflicts:
+            status = "unresolved conflicts"
         lines = [
             f"# Lecture import: {state.course}",
             "",
@@ -1347,8 +1359,9 @@ class Pipeline:
             lines.append("Merged:")
             lines.extend(f"- `{path}`" for path in merged)
         if applied and applied.conflicts:
-            lines.append("Manual merges (conflict files, note untouched):")
-            lines.extend(f"- `{path}`" for path in applied.conflicts)
+            lines.append("Manual merges (resolve the conflict markers in the note):")
+            for conflict in applied.conflicts:
+                lines.append(f"- `{conflict.path}` ({conflict.notes or 'resolve in the note'})")
         if applied and applied.skipped_merges:
             lines.append("Skipped merges (needs review):")
             lines.extend(f"- `{path}`" for path in applied.skipped_merges)
@@ -1548,7 +1561,7 @@ def _apply_dict(result: ApplyResult) -> dict[str, Any]:
         "moc": [asdict(record) for record in result.moc],
         "applied_paths": result.applied_paths,
         "skipped_merges": result.skipped_merges,
-        "conflicts": result.conflicts,
+        "conflicts": [asdict(record) for record in result.conflicts],
         "refused": result.refused,
         "todos": [todo.model_dump() for todo in result.todos],
     }
