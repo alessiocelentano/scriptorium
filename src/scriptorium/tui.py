@@ -57,7 +57,9 @@ it to normal mode.  The Extras pane can be selected too: ``c`` copies every
 aside to the system clipboard, and ``w`` opens a floating window that writes
 them to a file.  The window offers the search paths from the settings
 as destinations and one ``new path`` entry whose field completes files and
-directories; an existing file is appended to, never overwritten.  A merge that
+directories; ``Enter`` only selects the destination and ``y`` performs the
+write, because a reflexive ``Enter`` must never append to a file.  An existing
+file is appended to, never overwritten.  A merge that
 needs review is shown inside the Changes box, never in a
 floating window.  Focused boxes get a white border while a box selected with
 ``Enter`` gets a green one, and the input box carries a coloured badge with the
@@ -2448,7 +2450,7 @@ class TuiApp:
             return
 
         if state.page == wizard.PAGE_REVIEW and state.confirm:
-            if key in {"y", "\n", "\r", curses.KEY_ENTER, 10, 13}:
+            if key == "y":
                 self._save_wizard()
             elif key in {"b", "n", "q", "\x1b"}:
                 state.confirm = False
@@ -2490,17 +2492,11 @@ class TuiApp:
             state.completion = None
             return
 
-        if key == "\x1b":
-            state.message = "setup must be completed: Enter saves it on the review page"
-            return
-        if key == "\t" or key == "n":
-            self._wizard_move_page(state, 1)
-            return
-        if key == curses.KEY_BTAB or key == "b":
-            self._wizard_move_page(state, -1)
-            return
         if state.page == wizard.PAGE_REVIEW:
-            if key in {"\n", "\r", curses.KEY_ENTER, 10, 13}:
+            # Saving writes config.toml and may create the notes root, so no
+            # navigation key confirms it: Enter is the "select" key everywhere
+            # else in the interface and a reflexive Enter must not write.
+            if key == "y":
                 errors = wizard.review_errors(state.values)
                 if errors:
                     # Red rows mean the run may fail: ask before saving.  The
@@ -2510,6 +2506,23 @@ class TuiApp:
                     state.message = wizard.REVIEW_WARNING
                 else:
                     self._save_wizard()
+                return
+            if key == "\t":
+                self._wizard_move_page(state, 1)
+                return
+            if key in {"\x1b", "n"} or key == curses.KEY_BTAB or key == "b":
+                self._wizard_move_page(state, -1)
+                state.message = ""
+            return
+
+        if key == "\x1b":
+            state.message = "setup must be completed: y saves it on the review page"
+            return
+        if key == "\t" or key == "n":
+            self._wizard_move_page(state, 1)
+            return
+        if key == curses.KEY_BTAB or key == "b":
+            self._wizard_move_page(state, -1)
             return
 
         rows = self._wizard_rows(state)
@@ -2792,6 +2805,8 @@ class TuiApp:
         start = str(roots[0]) + os.sep if roots else str(Path.home()) + os.sep
         modal.editor = self._new_editor(start, mode=MODE_INSERT)
         modal.completion = None
+        # The path being typed replaces whatever destination was staged before.
+        modal.payload["target"] = None
         modal.message = "type a file path · Tab completes files and directories"
 
     def _handle_extras_export_key(self, modal: PromptModal, key: Any) -> None:
@@ -2834,18 +2849,30 @@ class TuiApp:
             return
         if self._is_down_key(key):
             modal.selected = min(len(roots), modal.selected + 1)
+            modal.payload["target"] = None
+            modal.message = ""
             return
         if self._is_up_key(key):
             modal.selected = max(0, modal.selected - 1)
+            modal.payload["target"] = None
+            modal.message = ""
             return
         if key in {"n", "N", "+"}:
             self._start_extras_export_edit(modal)
             return
+        # Writing the extras appends a file, so it is never the default key:
+        # Enter only selects the destination, and ``y`` performs the write.
         if key in {"\n", "\r", curses.KEY_ENTER, 10, 13}:
             if modal.selected < len(roots):
-                self._write_extras(modal, roots[modal.selected] / DEFAULT_EXPORT_NAME)
+                self._stage_extras_export_target(modal, roots[modal.selected] / DEFAULT_EXPORT_NAME)
             else:
                 self._start_extras_export_edit(modal)
+            return
+        if key == "y":
+            target = self._extras_export_target(modal)
+            if target is None:
+                return
+            self._write_extras(modal, target)
 
     def _start_extras_export_completion(self, modal: PromptModal) -> None:
         editor = modal.editor
@@ -2884,6 +2911,7 @@ class TuiApp:
         popup.end = len(text)
 
     def _commit_extras_export_path(self, modal: PromptModal) -> None:
+        """Accept the typed path as the destination; ``y`` performs the write."""
         editor = modal.editor
         if editor is None:
             return
@@ -2901,7 +2929,22 @@ class TuiApp:
         if not candidate.parent.is_dir():
             modal.message = f"directory does not exist: {candidate.parent}"
             return
-        self._write_extras(modal, candidate)
+        modal.editor = None
+        self._stage_extras_export_target(modal, candidate)
+
+    def _stage_extras_export_target(self, modal: PromptModal, target: Path) -> None:
+        modal.payload["target"] = str(target)
+        modal.message = f"{target} · press y to write"
+
+    def _extras_export_target(self, modal: PromptModal) -> Path | None:
+        """The staged destination, or the selected root's default file name."""
+        staged = modal.payload.get("target")
+        if staged:
+            return Path(str(staged))
+        roots = self._extras_export_roots(modal)
+        if modal.selected < len(roots):
+            return roots[modal.selected] / DEFAULT_EXPORT_NAME
+        return None
 
     def _write_extras(self, modal: PromptModal, target: Path) -> None:
         try:
@@ -3144,9 +3187,9 @@ class TuiApp:
             if state.confirm:
                 footer = "b back · y save anyway"
             elif wizard.review_errors(state.values):
-                footer = "Enter continue · b back"
+                footer = "y save anyway · b back"
             else:
-                footer = "Enter save and start · b back"
+                footer = "y save and start · b back"
         elif state.editor is not None:
             footer = "Tab complete · Enter accept · Esc cancel"
         else:
@@ -3190,7 +3233,13 @@ class TuiApp:
             # red row is present; the red rows below spell out each problem.
             show_warning = state.confirm or bool(wizard.review_errors(state.values))
             if show_warning:
-                for piece in _wrap(wizard.REVIEW_WARNING, content_w):
+                # An armed confirmation carries the generic warning, but a
+                # failed save replaces it with the specific reason; show that
+                # reason in the same red header instead of hiding it below.
+                header = wizard.REVIEW_WARNING
+                if state.confirm and state.message:
+                    header = state.message
+                for piece in _wrap(header, content_w):
                     display.append([(piece, STYLE_ERROR)])
                 display.append([])
             for row in wizard.review(state.values):
@@ -3479,7 +3528,7 @@ class TuiApp:
         w = max(24, min(cols - 4, cols // 2))
         inner_w = max(1, w - 4)
         hint_lines = _wrap(
-            "Choose a configured root or write to a new path. An existing file is appended to.",
+            "Choose a root, then y writes it; n picks a new path. An existing file is appended to.",
             inner_w,
         )
         entries = [str(root / DEFAULT_EXPORT_NAME) for root in roots]
@@ -3495,11 +3544,11 @@ class TuiApp:
         y, x, h, w = self._floating_rect(rows, cols, w, height)
         self._fill_rect(y, x, h, w)
         footer = (
-            "Tab complete · Enter write · Esc back"
+            "Tab complete · Enter accept · Esc back"
             if modal.editor is not None
-            else "j/k choose · Enter write · n new path · Esc close"
+            else "j/k choose · y write · n new path · Esc close"
             if self.vim_movements
-            else "↑/↓ choose · Enter write · n new path · Esc close"
+            else "↑/↓ choose · y write · n new path · Esc close"
         )
         self._draw_box(
             y,
@@ -3563,6 +3612,10 @@ class TuiApp:
             except curses.error:
                 pass
         message_y = edit_y + 2 if modal.editor is not None else y + h - 2
+        # A wrapped message needs more than the last content row of the box, so
+        # move it up instead of dropping its tail on the bottom border.
+        if message_lines and message_y + len(message_lines) > y + h - 1:
+            message_y = max(list_y, y + h - 1 - len(message_lines))
         for offset, line in enumerate(message_lines):
             if message_y + offset >= y + h - 1:
                 break

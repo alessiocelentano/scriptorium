@@ -286,14 +286,15 @@ pages -- vault, model, speech, review -- and deliberately covers only what the
 first run needs; every other option stays in the full settings modal (`s`).
 Two wizard-only choices map onto real keys: `llm_provider` selects the DeepSeek
 default, a local Ollama endpoint or a custom base URL, and `asr_mode` selects
-the local pipeline or a remote transcription endpoint.  `Enter` on the review
+the local pipeline or a remote transcription endpoint.  `y` on the review
 page creates the notes root if needed, goes through `write_config_values` and
 only then records the marker: there is no skip key, so the first run always
-writes a working `config.toml`.  A CLI `scriptorium run` never opens curses: on
-a first run it prints a one-line hint to start the TUI instead.  Delete the
-marker to see the wizard again at startup, or type `/wizard` in the input line
-to reopen it from a running session; saving rewrites `config.toml` and re-touches
-the marker.
+writes a working `config.toml`, and `Enter` -- the selection key everywhere
+else -- deliberately never confirms that write.  A CLI `scriptorium run` never
+opens curses: on a first run it prints a one-line hint to start the TUI instead.
+Delete the marker to see the wizard again at startup, or type `/wizard` in the
+input line to reopen it from a running session; saving rewrites `config.toml`
+and re-touches the marker.
 
 `tui_layout.py` owns the pane topology and geometry.  `Config.tui_layout` is a
 tree of `Leaf` and `Split` nodes parsed from `tui_layout` in `config.toml`:

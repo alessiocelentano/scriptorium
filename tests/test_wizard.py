@@ -357,7 +357,7 @@ class WizardTuiTests(unittest.TestCase):
         assert isinstance(paths, list)
         self.assertIn(self.vault.resolve(), [Path(path) for path in paths])
 
-    def test_review_page_enter_saves_and_creates_the_notes_root(self):
+    def test_review_page_y_saves_and_creates_the_notes_root(self):
         app = self._app()
         app.open_setup_wizard()
         state = app.wizard
@@ -368,7 +368,7 @@ class WizardTuiTests(unittest.TestCase):
         for _ in range(3):
             app._handle_wizard_key("\t")
         self.assertEqual(state.page, wizard.PAGE_REVIEW)
-        app._handle_wizard_key("\n")
+        app._handle_wizard_key("y")
         self.assertIsNone(app.wizard)
         self.assertTrue(new_root.is_dir())
         self.assertEqual(app.config.notes_root, new_root)
@@ -385,7 +385,7 @@ class WizardTuiTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             for _ in range(3):
                 app._handle_wizard_key("\t")
-            app._handle_wizard_key("\n")
+            app._handle_wizard_key("y")
             self.assertIsNotNone(app.wizard)
             self.assertTrue(state.confirm)
             self.assertIn("may not work properly", state.message)
@@ -401,7 +401,7 @@ class WizardTuiTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             for _ in range(3):
                 app._handle_wizard_key("\t")
-            app._handle_wizard_key("\n")
+            app._handle_wizard_key("y")
             app._handle_wizard_key("y")
         self.assertIsNone(app.wizard)
         self.mark_mock.assert_called_once()
@@ -415,7 +415,7 @@ class WizardTuiTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             for _ in range(3):
                 app._handle_wizard_key("\t")
-            app._handle_wizard_key("\n")
+            app._handle_wizard_key("y")
             app._handle_wizard_key("b")
         self.assertIsNotNone(app.wizard)
         self.assertFalse(state.confirm)
@@ -438,7 +438,7 @@ class WizardTuiTests(unittest.TestCase):
         assert state is not None
         app._handle_wizard_key("\x1b")
         self.assertIsNotNone(app.wizard)
-        self.assertIn("Enter saves", state.message)
+        self.assertIn("y saves", state.message)
         self.assertEqual(self.written, {})
         self.mark_mock.assert_not_called()
 
@@ -557,7 +557,7 @@ class WizardTuiTests(unittest.TestCase):
         state.values["llm_provider"] = wizard.LLM_CUSTOM
         state.values["llm_base_url"] = ""
         state.page = wizard.PAGE_REVIEW
-        app._handle_wizard_key("\n")
+        app._handle_wizard_key("y")
         self.assertIsNotNone(app.wizard)
         self.assertTrue(state.confirm)
         self.assertIn("may not work properly", state.message)
@@ -566,7 +566,7 @@ class WizardTuiTests(unittest.TestCase):
         self.assertTrue(any("base URL" in detail for detail in details))
         self.assertEqual(self.written, {})
 
-    def test_the_confirmation_header_is_drawn_before_enter_on_red_rows(self):
+    def test_the_confirmation_header_is_drawn_above_the_review_rows(self):
         app = self._app()
         app.open_setup_wizard()
         state = app.wizard
