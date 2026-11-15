@@ -141,7 +141,14 @@ from .tui_completion import (
     complete_paths,
     replace_token,
 )
-from .tui_data import CardGroup, DiffEntry, load_asides, load_card_groups, load_diff_entries
+from .tui_data import (
+    CardGroup,
+    DiffEntry,
+    load_asides,
+    load_card_groups,
+    load_diff_entries,
+    load_report_lines,
+)
 from .tui_input import missing_paths, parse_input, parse_pasted_input, path_exists
 from .tui_layout import (
     PANE_INPUT,
@@ -376,6 +383,8 @@ class TuiApp:
     card_groups: list[CardGroup] = field(default_factory=list)
     card_index: int = 0
     card_scroll: int = 0
+    report_lines: list[str] = field(default_factory=list)
+    report_scroll: int = 0
 
     current_job_id: str | None = None
     current_stage: str = ""
@@ -757,6 +766,7 @@ class TuiApp:
                     self.status = "job failed · Ctrl-L for the log · /resume to continue"
                 else:
                     self.status = "job failed · Ctrl-L for the log"
+                self._reload_report()
                 for line in str(payload).splitlines() or [str(payload)]:
                     self._on_log(f"[error] {line}")
                 if self.quit_requested:
@@ -791,9 +801,11 @@ class TuiApp:
             self.diff_entries = []
             self.card_groups = []
             self.asides = []
+            self.report_lines = []
             self.diff_index = 0
             self.card_index = 0
             self.extras_scroll = 0
+            self.report_scroll = 0
         elif kind == "group_start":
             self.current_group = str(event.get("topic") or event.get("group_id") or "")
             index = event.get("index")
@@ -913,10 +925,18 @@ class TuiApp:
         for name in self.panes:
             self.panes[name].on_asides(self)
 
+    def _reload_report(self) -> None:
+        path = self._job_path("report.md")
+        if path is None:
+            return
+        self.report_lines = load_report_lines(path)
+        self.report_scroll = min(self.report_scroll, max(0, len(self.report_lines) - 1))
+
     def _reload_artifacts(self) -> None:
         self._reload_diffs()
         self._reload_cards()
         self._reload_asides()
+        self._reload_report()
 
     def _upsert_diff(self, entry: DiffEntry) -> None:
         if not entry.group:
@@ -1105,6 +1125,8 @@ class TuiApp:
         self.card_groups = []
         self.card_index = 0
         self.card_scroll = 0
+        self.report_lines = []
+        self.report_scroll = 0
         self.current_job_id = None
         self.current_stage = ""
         self.current_group = ""
@@ -1214,6 +1236,8 @@ class TuiApp:
         self.card_groups = list(entry.card_groups)
         self.card_index = 0
         self.card_scroll = 0
+        self.report_lines = []
+        self.report_scroll = 0
         self.asides = list(entry.extras)
         self.extras_scroll = 0
         self.current_stage = ""
@@ -1317,9 +1341,11 @@ class TuiApp:
         self.diff_entries = []
         self.card_groups = []
         self.asides = []
+        self.report_lines = []
         self.diff_index = 0
         self.card_index = 0
         self.extras_scroll = 0
+        self.report_scroll = 0
         self.current_job_id = request.job_id
         self.status = request.status
         self.editor.set_mode(self._base_mode())

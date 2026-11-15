@@ -72,6 +72,17 @@ def load_diff_entries(path: Path) -> list[DiffEntry]:
     return entries
 
 
+def load_report_lines(path: Path) -> list[str]:
+    """Read the run report into display lines for the Report pane."""
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    return text.splitlines() or []
+
+
 def load_asides(plan_path: Path, extract_path: Path | None = None) -> list[Aside]:
     """Off-topic material extracted from the transcript, shown in the Extras pane.
 
@@ -80,9 +91,7 @@ def load_asides(plan_path: Path, extract_path: Path | None = None) -> list[Aside
     """
     if extract_path is not None and extract_path.is_file():
         try:
-            extract = ExtractResult.model_validate_json(
-                extract_path.read_text(encoding="utf-8")
-            )
+            extract = ExtractResult.model_validate_json(extract_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
         else:

@@ -236,7 +236,7 @@ The input line adds one source at a time.  Select the box with `Enter` (or with
 editing the line; a second `Esc` leaves the box.  `Enter` then appends the resolved path to the
 Sources pane, clears the editor and returns the box to normal mode, while
 `/run` starts the pipeline with the collected paths, `/new` clears the
-current session (sources, changes, cards, extras and logs) without deleting the
+current session (sources, changes, cards, extras, report and logs) without deleting the
 job directories under `$SCRIPTORIUM_ARTIFACTS_DIR`, and `/wizard` reopens the
 setup wizard.  Sources are data owned by `tui.py`,
 never parsed from the input line at run time; `d` removes the selected entry.  A
@@ -333,8 +333,8 @@ Every box is a self-contained extension.  A pane module imports
 `pane_api.py` (the contract), `tui_render.py` (the drawing primitives) and the
 data it displays -- never `tui.py` -- so a box can be written, unit-tested and
 shipped in one file.  The built-in boxes are `panes/sources.py`,
-`panes/changes.py`, `panes/flashcards.py`, `panes/extras.py`, `panes/logs.py`
-and `panes/input_pane.py`; `tests/test_panes.py` asserts that no pane module
+`panes/changes.py`, `panes/flashcards.py`, `panes/extras.py`, `panes/logs.py`,
+`panes/report.py` and `panes/input_pane.py`; `tests/test_panes.py` asserts that no pane module
 imports the application.
 
 `pane_api.Pane` defines the box: metadata (`name`, `placeable`, `parent`,
