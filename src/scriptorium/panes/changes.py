@@ -11,7 +11,7 @@ from __future__ import annotations
 import curses
 from typing import Any
 
-from ..pane_api import Pane, PaneHost
+from ..pane_api import PaneHost, ScrollablePane
 from ..state import Stage
 from ..tui_layout import PaneRect
 from ..tui_render import STYLE_DIM, STYLE_HEADING, STYLE_SELECTED, diff_style, wrap
@@ -38,7 +38,7 @@ GROUP_LABELS = (
 MERGE_ANSWERS = {"y": "apply", "n": "skip", "m": "manual", "a": "all", "q": "quit"}
 
 
-class ChangesPane(Pane):
+class ChangesPane(ScrollablePane):
     """Vault changes, their diffs and the pending merge review."""
 
     name = "changes"
@@ -104,7 +104,7 @@ class ChangesPane(Pane):
         return host.diff_scroll
 
     def set_scroll(self, host: PaneHost, value: int) -> None:
-        host.diff_scroll = max(0, value)
+        host.diff_scroll = self.clamp_scroll(host, value)
 
     # -- drawing -------------------------------------------------------------- #
 

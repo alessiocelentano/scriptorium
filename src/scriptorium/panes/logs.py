@@ -9,15 +9,14 @@ at the right edge.
 
 from __future__ import annotations
 
-import curses
+from pathlib import Path
 from typing import Any
 
-from ..pane_api import ENTER_KEYS, PAGE_DOWN_KEYS, PAGE_UP_KEYS, Pane, PaneHost
-from ..tui_layout import PaneRect
+from ..pane_api import PaneHost, PaneRect, ScrollablePane
 from ..tui_render import STYLE_DIM, wrap
 
 
-class LogsPane(Pane):
+class LogsPane(ScrollablePane):
     """The inline log viewer."""
 
     name = "logs"
@@ -30,31 +29,26 @@ class LogsPane(Pane):
     def title(self, host: PaneHost) -> str:
         return f"Logs · {len(host.log_lines)} lines"
 
+    def footer(self, host: PaneHost) -> str:
+        return "c copy · w write"
+
     def rows(self, host: PaneHost) -> tuple[list[tuple[str, str]], int]:
         return [], -1
 
     # -- scroll --------------------------------------------------------------- #
 
-    def display_lines(self, host: PaneHost) -> list[str]:
+    def display_lines(self, host: PaneHost, rect: PaneRect | None = None) -> list[tuple[str, str]]:
         """The log text soft-wrapped to the width of the box."""
-        rect = host.layout_rects().get(self.name)
-        width = max(1, (rect.w - 4) if rect is not None else 40)
-        lines: list[str] = []
+        lines: list[tuple[str, str]] = []
         for line in host.log_lines or ["(no logs yet)"]:
-            lines.extend(wrap(line, width))
+            lines.extend((piece, STYLE_DIM) for piece in wrap(line, self.content_width(host, rect)))
         return lines
-
-    def scroll_limit(self, host: PaneHost) -> int:
-        return max(0, len(self.display_lines(host)) - 1)
 
     def scroll(self, host: PaneHost) -> int:
         return host.log_scroll
 
     def set_scroll(self, host: PaneHost, value: int) -> None:
-        host.log_scroll = max(0, min(self.scroll_limit(host), value))
-
-    def scroll_by(self, host: PaneHost, delta: int) -> None:
-        self.set_scroll(host, self.scroll(host) + delta)
+        host.log_scroll = self.clamp_scroll(host, value)
 
     def on_shown(self, host: PaneHost) -> None:
         """Open the viewer at its last page."""
@@ -65,40 +59,41 @@ class LogsPane(Pane):
         if host.pane_shown(self.name):
             self.set_scroll(host, self.scroll(host))
 
-    # -- drawing -------------------------------------------------------------- #
+    # -- copy / write ---------------------------------------------------------- #
 
-    def draw(self, host: PaneHost, rect: PaneRect) -> None:
-        if rect.h < 3 or rect.w < 4:
+    def copy(self, host: PaneHost) -> None:
+        """Copy the log buffer to the system clipboard."""
+        if not host.log_lines:
+            host.status = "no logs to copy"
             return
-        painter = host.painter
-        painter.draw_box(
-            rect.y,
-            rect.x,
-            rect.h,
-            rect.w,
-            self.title(host),
-            self.footer(host),
-            host.focus == self.name,
-            [],
-            0,
-            0,
-            active=host.active == self.name,
-        )
-        lines = self.display_lines(host)
-        visible = max(1, rect.h - 3)
-        self.set_scroll(host, min(self.scroll(host), max(0, len(lines) - visible)))
-        for offset in range(visible):
-            index = self.scroll(host) + offset
-            if index >= len(lines):
-                break
-            painter.addstr(rect.y + 1 + offset, rect.x + 2, lines[index], painter.attr(STYLE_DIM))
+        if host.copy_text("\n".join(host.log_lines)):
+            host.status = f"copied {len(host.log_lines)} log lines to the clipboard"
+        else:
+            host.status = "could not copy: no clipboard backend available"
+
+    def write(self, host: PaneHost) -> None:
+        """Write the log buffer to a deterministic path under the artifacts dir."""
+        if not host.log_lines:
+            host.status = "no logs to write"
+            return
+        target = Path(host.config.artifacts_dir) / "logs.txt"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("\n".join(host.log_lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            host.status = f"could not write logs: {exc}"
+            return
+        host.status = f"wrote {len(host.log_lines)} log lines to {target}"
 
     # -- keys ----------------------------------------------------------------- #
 
     def handle_key(self, host: PaneHost, key: Any, *, active: bool) -> bool:
-        if key in ENTER_KEYS and not active:
-            # Enter is the host's "select this box" key.
-            return False
+        if key in {"c", "C"}:
+            self.copy(host)
+            return True
+        if key in {"w", "W"}:
+            self.write(host)
+            return True
         if key in {"\x1b", "q", "Q"} and active:
             if key in {"q", "Q"}:
                 host.request_quit()
@@ -108,40 +103,4 @@ class LogsPane(Pane):
         if key == "f":
             host.toggle_fullscreen()
             return True
-        vim = host.vim_movements
-        if key == "g" or key == curses.KEY_HOME:
-            if vim or active:
-                self.set_scroll(host, 0)
-                return True
-            return False
-        if key == "G" or key == curses.KEY_END:
-            if vim or active:
-                self.set_scroll(host, self.scroll_limit(host))
-                return True
-            return False
-        rect = host.layout_rects().get(self.name)
-        if key in PAGE_DOWN_KEYS:
-            self.scroll_by(host, max(1, self.page(host, rect)))
-            return True
-        if key in PAGE_UP_KEYS:
-            self.scroll_by(host, -max(1, self.page(host, rect)))
-            return True
-        if key == curses.KEY_DOWN:
-            # In Vim mode the arrows are free (h/j/k/l move the focus), so they
-            # scroll; in standard mode the host uses them to move the focus.
-            if active or vim:
-                self.scroll_by(host, 1)
-                return True
-            return False
-        if key == curses.KEY_UP:
-            if active or vim:
-                self.scroll_by(host, -1)
-                return True
-            return False
-        if active and key == "j":
-            self.scroll_by(host, 1)
-            return True
-        if active and key == "k":
-            self.scroll_by(host, -1)
-            return True
-        return False
+        return super().handle_key(host, key, active=active)

@@ -73,8 +73,10 @@ MODE_INSERT = "insert"
 MODE_NORMAL = "normal"
 
 ENTER_KEYS = frozenset({"\n", "\r", curses.KEY_ENTER, 10, 13})
-PAGE_DOWN_KEYS = frozenset({curses.KEY_NPAGE, "\x04"})
-PAGE_UP_KEYS = frozenset({curses.KEY_PPAGE, "\x15"})
+PAGE_DOWN_KEYS = frozenset({curses.KEY_NPAGE, "\x06"})
+PAGE_UP_KEYS = frozenset({curses.KEY_PPAGE, "\x02"})
+HALF_PAGE_DOWN_KEYS = frozenset({"\x04"})
+HALF_PAGE_UP_KEYS = frozenset({"\x15"})
 
 
 @runtime_checkable
@@ -364,16 +366,219 @@ class Pane:
         return max(1, (rect.h - 3) if rect is not None else 1)
 
 
+class ScrollablePane(Pane):
+    """Shared pager behaviour for the Logs, Changes and Extras boxes.
+
+    A ``ScrollablePane`` scrolls a wrapped list of ``(text, style)`` rows and
+    paints a right-edge scrollbar when the rows exceed the box.  Read-only
+    boxes override :meth:`display_lines` and return False from
+    :meth:`has_selection`; selectable boxes (Changes) keep the normal ``Pane``
+    list keys and this mixin only adds the page motions, so scrolling composes
+    with the existing selection instead of replacing it.  The optional
+    :meth:`copy` and :meth:`write` hooks give a pane one place to define its
+    clipboard text and file output.
+    """
+
+    def display_lines(self, host: PaneHost, rect: PaneRect | None = None) -> list[Row]:
+        """Rows soft-wrapped to the box's content width."""
+        rows, _ = self.rows(host)
+        width = self.content_width(host, rect)
+        lines: list[Row] = []
+        for text, style in rows:
+            lines.extend((piece, style) for piece in wrap(text, width))
+        return lines
+
+    def content_width(self, host: PaneHost, rect: PaneRect | None = None) -> int:
+        """Content columns left after the border and the scrollbar.
+
+        ``rect`` is the box rectangle passed to :meth:`draw`; when omitted the
+        pane's current layout rectangle is used so scroll helpers stay usable
+        outside of drawing.
+        """
+        if rect is None:
+            rect = host.layout_rects().get(self.name)
+        return max(1, (rect.w - 3) if rect is not None else 40)
+
+    def viewport_height(self, host: PaneHost, rect: PaneRect | None = None) -> int:
+        """Visible content rows inside the box."""
+        if rect is None:
+            rect = host.layout_rects().get(self.name)
+        return max(1, (rect.h - 2) if rect is not None else 1)
+
+    def page_height(self, host: PaneHost) -> int:
+        """Rows advanced by a full page (one row of context is kept)."""
+        rect = host.layout_rects().get(self.name)
+        return self.page(host, rect)
+
+    def half_page_height(self, host: PaneHost) -> int:
+        """Rows advanced by half a page."""
+        return max(1, self.page_height(host) // 2)
+
+    def scroll_limit(self, host: PaneHost) -> int:
+        """Highest useful scroll offset: the last page's first row."""
+        return max(0, len(self.display_lines(host)) - self.viewport_height(host))
+
+    def scroll_by(self, host: PaneHost, delta: int) -> None:
+        """Move the scroll offset by ``delta`` rows."""
+        self.set_scroll(host, self.scroll(host) + delta)
+
+    def clamp_scroll(self, host: PaneHost, value: int) -> int:
+        """Clamp a scroll offset to the current content."""
+        return max(0, min(self.scroll_limit(host), value))
+
+    def copy(self, host: PaneHost) -> None:
+        """Copy the displayed content to the clipboard; override per pane."""
+
+    def write(self, host: PaneHost) -> None:
+        """Write the displayed content to a file; override per pane."""
+
+    # -- drawing -------------------------------------------------------------- #
+
+    def draw(self, host: PaneHost, rect: PaneRect) -> None:
+        """Draw the box with a scrollbar, keeping selection when present."""
+        if rect.h < 3 or rect.w < 4:
+            return
+        focused = host.focus == self.name
+        active = host.active == self.name
+        if self.has_selection():
+            rows, selected = self.rows(host)
+            scroll = host.painter.draw_box(
+                rect.y,
+                rect.x,
+                rect.h,
+                rect.w,
+                self.title(host),
+                self.footer(host),
+                focused,
+                rows,
+                self.scroll(host),
+                selected,
+                active=active,
+                scrollbar=True,
+            )
+            if focused:
+                self.set_scroll(host, scroll)
+            return
+        lines = self.display_lines(host, rect)
+        painter = host.painter
+        painter.draw_box(
+            rect.y,
+            rect.x,
+            rect.h,
+            rect.w,
+            self.title(host),
+            self.footer(host),
+            focused,
+            [],
+            0,
+            0,
+            active=active,
+        )
+        viewport = self.viewport_height(host, rect)
+        scroll = painter.draw_lines(
+            rect.y + 1,
+            rect.x + 1,
+            viewport,
+            self.content_width(host, rect),
+            lines,
+            self.scroll(host),
+            active=active,
+        )
+        painter.draw_scrollbar(
+            rect.y + 1,
+            rect.x + rect.w - 2,
+            viewport,
+            scroll,
+            viewport,
+            len(lines),
+        )
+        if focused:
+            self.set_scroll(host, scroll)
+
+    # -- keys ----------------------------------------------------------------- #
+
+    def handle_key(self, host: PaneHost, key: Any, *, active: bool) -> bool:
+        """Handle the pager keys, delegating selection keys to :class:`Pane`."""
+        if self.has_selection():
+            return self._handle_selectable_key(host, key, active=active)
+        return self._handle_readonly_key(host, key, active=active)
+
+    def _handle_selectable_key(self, host: PaneHost, key: Any, *, active: bool) -> bool:
+        """Page motions move the selection; the base class owns the list keys."""
+        if key in HALF_PAGE_DOWN_KEYS:
+            self.move(host, self.half_page_height(host))
+            return True
+        if key in HALF_PAGE_UP_KEYS:
+            self.move(host, -self.half_page_height(host))
+            return True
+        if key in PAGE_DOWN_KEYS:
+            self.move(host, self.page_height(host))
+            return True
+        if key in PAGE_UP_KEYS:
+            self.move(host, -self.page_height(host))
+            return True
+        return super().handle_key(host, key, active=active)
+
+    def _handle_readonly_key(self, host: PaneHost, key: Any, *, active: bool) -> bool:
+        """Pager navigation for a read-only box: j/k scroll, page keys page."""
+        if key in ENTER_KEYS and not active:
+            # Enter is the host's "select this box" key.
+            return False
+        vim = host.vim_movements
+        if key in HALF_PAGE_DOWN_KEYS:
+            self.scroll_by(host, self.half_page_height(host))
+            return True
+        if key in HALF_PAGE_UP_KEYS:
+            self.scroll_by(host, -self.half_page_height(host))
+            return True
+        if key in PAGE_DOWN_KEYS:
+            self.scroll_by(host, self.page_height(host))
+            return True
+        if key in PAGE_UP_KEYS:
+            self.scroll_by(host, -self.page_height(host))
+            return True
+        if key == "g" or key == curses.KEY_HOME:
+            if vim or active:
+                self.set_scroll(host, 0)
+                return True
+            return False
+        if key == "G" or key == curses.KEY_END:
+            if vim or active:
+                self.set_scroll(host, self.scroll_limit(host))
+                return True
+            return False
+        if key == curses.KEY_DOWN:
+            if active or vim:
+                self.scroll_by(host, 1)
+                return True
+            return False
+        if key == curses.KEY_UP:
+            if active or vim:
+                self.scroll_by(host, -1)
+                return True
+            return False
+        if active and key == "j":
+            self.scroll_by(host, 1)
+            return True
+        if active and key == "k":
+            self.scroll_by(host, -1)
+            return True
+        return False
+
+
 __all__ = [
     "Pane",
     "PaneHost",
     "PaneRect",
+    "ScrollablePane",
     "Row",
     "MODE_INSERT",
     "MODE_NORMAL",
     "ENTER_KEYS",
     "PAGE_DOWN_KEYS",
     "PAGE_UP_KEYS",
+    "HALF_PAGE_DOWN_KEYS",
+    "HALF_PAGE_UP_KEYS",
     "STYLE_TITLE",
     "STYLE_ADDED",
     "STYLE_REMOVED",
