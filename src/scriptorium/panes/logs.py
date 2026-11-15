@@ -22,6 +22,9 @@ class LogsPane(ScrollablePane):
     name = "logs"
     spawn_key = "C-l"
 
+    #: True while the view is pinned to the tail: a new log line scrolls it down.
+    _follow_tail: bool = True
+
     def has_selection(self) -> bool:
         """The log viewer scrolls a read-only buffer."""
         return False
@@ -37,11 +40,21 @@ class LogsPane(ScrollablePane):
 
     # -- scroll --------------------------------------------------------------- #
 
-    def display_lines(self, host: PaneHost, rect: PaneRect | None = None) -> list[tuple[str, str]]:
-        """The log text soft-wrapped to the width of the box."""
+    def display_lines(
+        self, host: PaneHost, rect: PaneRect | None = None
+    ) -> list[tuple[str, str]]:
+        """The log text soft-wrapped to the width of the box.
+
+        One message is one entry in ``host.log_lines``, so each message is
+        wrapped on its own: its continuation rows stay together and the blank
+        separator only ever lands between two messages.
+        """
+        width = self.content_width(host, rect)
         lines: list[tuple[str, str]] = []
-        for line in host.log_lines or ["(no logs yet)"]:
-            lines.extend((piece, STYLE_DIM) for piece in wrap(line, self.content_width(host, rect)))
+        for index, message in enumerate(host.log_lines or ["(no logs yet)"]):
+            if index:
+                lines.append(("", STYLE_DIM))
+            lines.extend((piece, STYLE_DIM) for piece in wrap(message, width))
         return lines
 
     def scroll(self, host: PaneHost) -> int:
@@ -49,15 +62,18 @@ class LogsPane(ScrollablePane):
 
     def set_scroll(self, host: PaneHost, value: int) -> None:
         host.log_scroll = self.clamp_scroll(host, value)
+        # Reaching the bottom re-attaches the view to the tail; any offset above
+        # it means the user scrolled up and must keep their place.
+        self._follow_tail = host.log_scroll >= self.scroll_limit(host)
 
     def on_shown(self, host: PaneHost) -> None:
-        """Open the viewer at its last page."""
+        """Open the viewer at its last page, following the tail from there."""
         self.set_scroll(host, self.scroll_limit(host))
 
     def on_log(self, host: PaneHost) -> None:
-        """Keep the scroll inside the content after new log lines arrive."""
-        if host.pane_shown(self.name):
-            self.set_scroll(host, self.scroll(host))
+        """Follow the new last line unless the reader scrolled up."""
+        if self._follow_tail and host.pane_shown(self.name):
+            self.set_scroll(host, self.scroll_limit(host))
 
     # -- copy / write ---------------------------------------------------------- #
 

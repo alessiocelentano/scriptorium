@@ -2112,6 +2112,17 @@ class LogWindowTests(unittest.TestCase):
             for y in range(app.scr.rows)
         )
 
+    def _log_rows(self, app, count: int) -> list[str]:
+        """The first ``count`` content rows inside the log box."""
+        rect = app.layout_rects()["logs"]
+        return [
+            "".join(
+                app.scr.cells.get((rect.y + 1 + offset, x), " ")
+                for x in range(rect.x + 1, rect.x + rect.w - 2)
+            )
+            for offset in range(count)
+        ]
+
     def test_logs_stay_hidden_until_the_window_is_opened(self):
         app = TuiApp(config=self.config)
         app.scr = FakeScreen()
@@ -2451,6 +2462,65 @@ class LogWindowTests(unittest.TestCase):
         self.assertNotIn("Esc normal", text)
         self.assertNotIn("Enter run", text)
         self.assertNotIn("s settings", text.split("Input", 1)[1])
+
+    def test_new_lines_follow_the_tail_while_the_view_sits_at_the_bottom(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.log_lines = [f"line {index}" for index in range(40)]
+        app._handle_normal_key("\x0c")
+        app._draw()
+        at_tail = app.log_scroll
+        self.assertEqual(at_tail, app.panes["logs"].scroll_limit(app))
+        app._on_log("line 40")
+        app._draw()
+        self.assertGreater(app.log_scroll, at_tail)
+        self.assertEqual(app.log_scroll, app.panes["logs"].scroll_limit(app))
+        self.assertIn("line 40", self._screen_text(app))
+
+    def test_new_lines_leave_a_scrolled_up_view_where_it_is(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.log_lines = [f"line {index}" for index in range(40)]
+        app._handle_normal_key("\x0c")
+        app.focus = "logs"
+        app._handle_normal_key(curses.KEY_UP)
+        parked = app.log_scroll
+        self.assertLess(parked, app.panes["logs"].scroll_limit(app))
+        app._on_log("late line")
+        app._draw()
+        self.assertEqual(app.log_scroll, parked)
+        self.assertNotIn("late line", self._screen_text(app))
+
+    def test_two_messages_get_one_blank_line_between_them(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.log_lines = ["first message", "second message"]
+        app._handle_normal_key("\x0c")
+        app._draw()
+        rows = self._log_rows(app, 3)
+        self.assertIn("first message", rows[0])
+        self.assertEqual(rows[1].strip(), "")
+        self.assertIn("second message", rows[2])
+
+    def test_a_long_message_wraps_without_blank_lines_inside_it(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app.log_lines = [" ".join(["wrapped"] * 60)]
+        app._handle_normal_key("\x0c")
+        app._draw()
+        rows = self._log_rows(app, app.layout_rects()["logs"].h - 3)
+        last = max(index for index, row in enumerate(rows) if row.strip())
+        # The message filled several rows in a row: no blank separator landed
+        # between two pieces of it.
+        self.assertGreater(last, 1)
+        self.assertTrue(all(row.strip() for row in rows[: last + 1]))
+
+    def test_the_placeholder_still_shows_when_there_are_no_logs(self):
+        app = TuiApp(config=self.config)
+        app.scr = FakeScreen()
+        app._handle_normal_key("\x0c")
+        app._draw()
+        self.assertIn("(no logs yet)", self._screen_text(app))
 
 
 class ScrollablePaneTests(unittest.TestCase):
