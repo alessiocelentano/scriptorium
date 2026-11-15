@@ -555,6 +555,72 @@ min_width = 20
             [first.resolve(), second.resolve()],
         )
 
+    def test_settings_modal_edits_a_search_path_in_place(self):
+        vault = self.root / "vault"
+        vault.mkdir()
+        first = self.root / "videos"
+        second = self.root / "downloads"
+        third = self.root / "archive"
+        first.mkdir()
+        second.mkdir()
+        third.mkdir()
+        config = Config(
+            notes_root=vault,
+            artifacts_dir=self.root / "home",
+            search_paths=(first, second),
+        )
+        app = TuiApp(config=config)
+        app.scr = FakeScreen()
+        app._open_settings()
+        state = app.settings
+        assert state is not None
+        # Paths section: notes root, artifacts dir, then the search-path rows.
+        # Three steps down land on the *second* search path, so the editor has
+        # to open that entry rather than the first one.
+        app._handle_settings_key("j")
+        app._handle_settings_key("j")
+        app._handle_settings_key("j")
+        app._handle_settings_key("e")
+        editor = state.editor
+        assert editor is not None
+        self.assertEqual(editor.text, str(second))
+        editor.set_text(str(third), 0)
+        app._handle_settings_key("\n")
+        self.assertIsNone(state.editor)
+        self.assertEqual(state.values["search_paths"], [str(first), str(third.resolve())])
+
+    def test_settings_modal_deletes_a_search_path(self):
+        vault = self.root / "vault"
+        vault.mkdir()
+        first = self.root / "videos"
+        second = self.root / "downloads"
+        third = self.root / "archive"
+        first.mkdir()
+        second.mkdir()
+        third.mkdir()
+        config = Config(
+            notes_root=vault,
+            artifacts_dir=self.root / "home",
+            search_paths=(first, second, third),
+        )
+        app = TuiApp(config=config)
+        app.scr = FakeScreen()
+        app._open_settings()
+        state = app.settings
+        assert state is not None
+        # Three steps down land on the *second* search path, so the delete has
+        # to remove that entry rather than the first one.
+        app._handle_settings_key("j")
+        app._handle_settings_key("j")
+        app._handle_settings_key("j")
+        app._handle_settings_key("d")
+        self.assertEqual(state.values["search_paths"], [str(first), str(third)])
+        # The highlight stays on the search-path row that took the deleted
+        # entry's place instead of jumping into the section's scalar rows.
+        rows = app._section_rows(state)
+        selected = rows[state.selected]
+        self.assertEqual((selected.field.key, selected.index), ("search_paths", 1))
+
     def test_settings_path_editor_completes_directories_with_tab(self):
         vault = self.root / "vault"
         vault.mkdir()
